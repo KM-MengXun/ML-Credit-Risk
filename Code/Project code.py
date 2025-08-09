@@ -1,5 +1,13 @@
+# %%
 import pandas as pd
 import numpy as np
+
+df_train = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df_train = df_train[(df_train['age'] > 0) & (df_train['age'] <= 100)]
+df_train_sorted = df_train.sort_values(by='age', ascending=True)
+df_train['MonthlyIncome'] = df_train['MonthlyIncome'].fillna(df_train['MonthlyIncome'].median())
+
+# %%
 
 # 🚀 Lasso Logistic Regression (baseline model)
 
