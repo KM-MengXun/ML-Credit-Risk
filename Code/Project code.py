@@ -103,17 +103,17 @@ for col in cols_past_due:
     # Cap extreme real values
     df[col] = np.where(df[col] > 10, 10, df[col]).astype(int)
 
-
 # Export cleaned data
 df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
 
-
-# === 3. Split the dataset ===
+# === 2. Split the dataset ===
 from sklearn.model_selection import train_test_split
 
 # Suppose df is already cleaned
-X = df.drop(columns=["SeriousDlqin2yrs"])
-y = df["SeriousDlqin2yrs"]
+TARGET = "SeriousDlqin2yrs"
+X = df.drop(columns=[TARGET])
+y = df[TARGET].astype(int)
+
 
 # First split into train+val and test (stratified)
 X_trainval, X_test, y_trainval, y_test = train_test_split(
@@ -125,4 +125,95 @@ X_train, X_val, y_train, y_val = train_test_split(
     X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
 )
 
-print("Train:", y_train.mean(), "Val:", y_val.mean(), "Test:", y_test.mean())
+
+# === 2. Split the dataset ===
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
+    confusion_matrix, classification_report
+)
+
+# L1 needs scaling for stable coefficients; StandardScaler is fine for all-numeric data
+pipe = Pipeline(steps=[
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(
+        penalty="l1",
+        solver="saga",            # supports L1 on large datasets
+        max_iter=5000,
+        class_weight="balanced",  # handle imbalance
+        random_state=42,
+        n_jobs=-1
+    ))
+])
+
+param_grid = {
+    "clf__C": np.logspace(-3, 1, 9)  # 0.001 ... 10
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+grid = GridSearchCV(
+    estimator=pipe,
+    param_grid=param_grid,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+grid.fit(X_train, y_train)
+best_model = grid.best_estimator_
+print("Best C:", grid.best_params_["clf__C"])
+print("CV ROC-AUC (mean):", grid.best_score_)
+
+# ===== 6) Validate on VAL set =====
+val_proba = best_model.predict_proba(X_val)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+
+# KS statistic (max TPR-FPR)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = np.max(ks_vals)
+thr_ks = thr[np.argmax(ks_vals)]
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
+
+# Choose threshold by max KS on validation
+val_pred = (val_proba >= thr_ks).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+
+# ===== 7) Retrain on TRAIN+VAL with best hyperparams, then evaluate on TEST =====
+best_model_final = GridSearchCV(
+    estimator=pipe,
+    param_grid={"clf__C": [grid.best_params_["clf__C"]]},
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1
+).fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val])).best_estimator_
+
+test_proba = best_model_final.predict_proba(X_test)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = np.max(tpr_t - fpr_t)
+
+# Use the threshold chosen on validation (thr_ks) for fair final metrics
+test_pred = (test_proba >= thr_ks).astype(int)
+
+print("\n=== TEST RESULTS (using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
