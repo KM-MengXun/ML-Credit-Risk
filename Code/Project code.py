@@ -11,7 +11,7 @@ from sklearn.impute import SimpleImputer
 # === 1. Load Data & Data Pre-processing ===
 #  File location for developers:
 
-df = pd.read_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -103,8 +103,8 @@ for col in cols_past_due:
     # Cap extreme real values
     df[col] = np.where(df[col] > 10, 10, df[col]).astype(int)
 
-# Export cleaned data
-df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
+# Export cleaned data 
+# df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
 
 # === 2. Split the dataset ===
 from sklearn.model_selection import train_test_split
@@ -207,6 +207,116 @@ fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
 ks_t = np.max(tpr_t - fpr_t)
 
 # Use the threshold chosen on validation (thr_ks) for fair final metrics
+test_pred = (test_proba >= thr_ks).astype(int)
+
+print("\n=== TEST RESULTS (using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
+
+
+# ======================================================================================
+# XGBoost
+import os, gc, numpy as np, pandas as pd
+from xgboost import XGBClassifier
+
+# 0) Reduce footprint: use float32 (no copy if already float32)
+X_train = X_train.astype(np.float32, copy=False)
+X_val   = X_val.astype(np.float32,   copy=False)
+X_test  = X_test.astype(np.float32,  copy=False)
+
+# 1) CV setup (smaller grid + 3-fold to save memory)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+pos, neg = int((y_train == 1).sum()), int((y_train == 0).sum())
+scale_pos_weight = neg / max(pos, 1)
+
+pipe_xgb = Pipeline([
+    # trees don't need scaling, but we must impute missing values
+    ("imp", SimpleImputer(strategy="median")),
+    ("xgb", XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",            # aligns with scoring="roc_auc"
+        tree_method="hist",
+        learning_rate=0.05,
+        n_estimators=600,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=1.0,
+        reg_lambda=1.0,
+        reg_alpha=0.0,
+        scale_pos_weight=scale_pos_weight,
+        n_jobs=max(1, os.cpu_count() // 2),  # intra-model threads
+        random_state=42,
+        verbosity=0
+    ))
+])
+
+# compact grid (8 combos)
+param_grid_xgb = {
+    "xgb__n_estimators": [400, 800],
+    "xgb__max_depth": [4, 6],
+    "xgb__learning_rate": [0.05, 0.1],
+    "xgb__min_child_weight": [1.0, 3.0],
+}
+
+grid_xgb = GridSearchCV(
+    estimator=pipe_xgb,
+    param_grid=param_grid_xgb,
+    scoring="roc_auc",     # keep identical to your L1 setup
+    cv=cv,
+    n_jobs=1,              # <<< single process to avoid pickling big data
+    verbose=1,
+    refit=True
+)
+
+# 2) Fit CV
+grid_xgb.fit(X_train, y_train)
+best_xgb = grid_xgb.best_estimator_
+print("Best params:", grid_xgb.best_params_)
+print("CV ROC-AUC :", grid_xgb.best_score_)
+gc.collect()
+
+# 3) Validate on VAL — get KS threshold
+val_proba = best_xgb.predict_proba(X_val)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks = float(thr[np.argmax(ks_vals)])
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
+
+val_pred = (val_proba >= thr_ks).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 4) Refit on TRAIN+VAL with best hyperparams (no extra CV)
+best_xgb_final = grid_xgb.best_estimator_
+X_trv = pd.concat([X_train, X_val], copy=False)
+y_trv = pd.concat([y_train, y_val], copy=False)
+best_xgb_final.fit(X_trv, y_trv)
+del X_trv, y_trv
+gc.collect()
+
+# 5) Final TEST evaluation (use validation KS threshold)
+test_proba = best_xgb_final.predict_proba(X_test)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+
 test_pred = (test_proba >= thr_ks).astype(int)
 
 print("\n=== TEST RESULTS (using validation KS threshold) ===")
