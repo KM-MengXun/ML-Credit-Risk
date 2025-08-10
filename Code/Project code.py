@@ -10,9 +10,8 @@ from sklearn.impute import SimpleImputer
 
 # === 1. Load Data & Data Pre-processing ===
 #  File location for developers:
-#   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
-df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df = pd.read_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -78,7 +77,34 @@ dep_series = dep_series.fillna(dep_median).astype("int8")
 df["NumberOfDependents"] = dep_series
 df["LargeFamilyFlag"] = (df["NumberOfDependents"] >= 5).astype("int8")
  
+# Number of Times Past Due Clean up
+cols_past_due = [
+    "NumberOfTime30-59DaysPastDueNotWorse",
+    "NumberOfTime60-89DaysPastDueNotWorse",
+    "NumberOfTimes90DaysLate"
+]
+
+for col in cols_past_due:
+    # Ensure numeric
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    
+    # Missing flag for special codes
+    df[f"{col}_MissingFlag"] = df[col].isin([96, 98]).astype(int)
+    
+    # Replace special codes with NaN
+    df[col] = df[col].replace({96: np.nan, 98: np.nan})
+    
+    # Calculate median from valid (non-NaN) values
+    median_val = df[col].median(skipna=True)
+    
+    # Fill NaN with median
+    df[col] = df[col].fillna(median_val)
+    
+    # Cap extreme real values
+    df[col] = np.where(df[col] > 10, 10, df[col]).astype(int)
+
+
 # Export cleaned data
-# df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
+df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
 
 
