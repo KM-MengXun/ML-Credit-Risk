@@ -108,3 +108,21 @@ for col in cols_past_due:
 df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
 
 
+# === 3. Split the dataset ===
+from sklearn.model_selection import train_test_split
+
+# Suppose df is already cleaned
+X = df.drop(columns=["SeriousDlqin2yrs"])
+y = df["SeriousDlqin2yrs"]
+
+# First split into train+val and test (stratified)
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Then split train+val into train and validation (stratified again)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
+)
+
+print("Train:", y_train.mean(), "Val:", y_val.mean(), "Test:", y_test.mean())
