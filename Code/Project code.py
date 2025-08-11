@@ -1,3 +1,26 @@
+# =========================== DETERMINISM HEADER (TOP) ===========================
+# Place ABOVE any numpy/pandas/scikit/xgboost/catboost imports.
+import os, random
+
+SEED = 42                           # single source of truth
+DETERMINISTIC = True                # flip to False for speed over strict repeatability
+THREADS = 1 if DETERMINISTIC else max(1, os.cpu_count() // 2)
+
+# Make numeric libs single-threaded to avoid nondeterministic reductions
+os.environ["OMP_NUM_THREADS"]        = "1" if DETERMINISTIC else str(THREADS)
+os.environ["OPENBLAS_NUM_THREADS"]   = "1" if DETERMINISTIC else str(THREADS)
+os.environ["MKL_NUM_THREADS"]        = "1" if DETERMINISTIC else str(THREADS)
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1" if DETERMINISTIC else str(THREADS)
+os.environ["NUMEXPR_NUM_THREADS"]    = "1" if DETERMINISTIC else str(THREADS)
+
+# Python & NumPy RNG
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+# ===============================================================================
+
+
+
+
 import pandas as pd
 import numpy as np
 
@@ -5,13 +28,13 @@ from sklearn.impute import SimpleImputer
 
 
 # --- file paths (edit TEST_PATH if needed) ---
-#   r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
+#   r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 #   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
 # === 1. Load Data & Data Pre-processing ===
 #  File location for developers:
 
-df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -117,16 +140,35 @@ y = df[TARGET].astype(int)
 
 # First split into train+val and test (stratified)
 X_trainval, X_test, y_trainval, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
+    X, y, test_size=0.2, stratify=y, random_state=SEED
 )
-
-# Then split train+val into train and validation (stratified again)
 X_train, X_val, y_train, y_val = train_test_split(
-    X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
+    X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=SEED
 )
 
+# ---------------- Persist splits so future runs use identical rows --------------
+from pathlib import Path
+split_dir = Path("./_splits"); split_dir.mkdir(exist_ok=True)
+f_train = split_dir / "train_idx.npy"
+f_val   = split_dir / "val_idx.npy"
+f_test  = split_dir / "test_idx.npy"
 
-# === 2. Split the dataset ===
+if all(f.exists() for f in (f_train, f_val, f_test)):
+    # Rebuild splits from saved indices (guaranteed identical)
+    idx_train = np.load(f_train, allow_pickle=False)
+    idx_val   = np.load(f_val,   allow_pickle=False)
+    idx_test  = np.load(f_test,  allow_pickle=False)
+    X_train, y_train = X.loc[idx_train], y.loc[idx_train]
+    X_val,   y_val   = X.loc[idx_val],   y.loc[idx_val]
+    X_test,  y_test  = X.loc[idx_test],  y.loc[idx_test]
+else:
+    # First run: save the indices we just generated with the fixed random_state
+    np.save(f_train, X_train.index.values)
+    np.save(f_val,   X_val.index.values)
+    np.save(f_test,  X_test.index.values)
+# ------------------------------------------------------------------------------
+
+
 from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -144,8 +186,8 @@ pipe = Pipeline(steps=[
         solver="saga",            # supports L1 on large datasets
         max_iter=5000,
         class_weight="balanced",  # handle imbalance
-        random_state=42,
-        n_jobs=-1
+        random_state=SEED,
+        n_jobs=THREADS
     ))
 ])
 
@@ -239,7 +281,7 @@ pipe_xgb = Pipeline([
     ("imp", SimpleImputer(strategy="median")),
     ("xgb", XGBClassifier(
         objective="binary:logistic",
-        eval_metric="auc",            # aligns with scoring="roc_auc"
+        eval_metric="auc",
         tree_method="hist",
         learning_rate=0.05,
         n_estimators=600,
@@ -250,8 +292,8 @@ pipe_xgb = Pipeline([
         reg_lambda=1.0,
         reg_alpha=0.0,
         scale_pos_weight=scale_pos_weight,
-        n_jobs=max(1, os.cpu_count() // 2),  # intra-model threads
-        random_state=42,
+        n_jobs=THREADS,
+        random_state=SEED,
         verbosity=0
     ))
 ])
@@ -327,3 +369,398 @@ print("\nTest Confusion Matrix:")
 print(confusion_matrix(y_test, test_pred))
 print("\nTest Classification Report:")
 print(classification_report(y_test, test_pred, digits=4))
+
+
+# ======================================================================================
+# CatBoost
+from catboost import CatBoostClassifier
+import gc
+
+# Convert to float32 (CatBoost handles its own NaN imputation)
+X_train_cb = X_train.copy()
+X_val_cb   = X_val.copy()
+X_test_cb  = X_test.copy()
+
+# Class weight for imbalance
+pos = int((y_train == 1).sum())
+neg = int((y_train == 0).sum())
+class_weights = [1.0, neg / max(pos, 1)]
+
+# Small param grid
+param_grid_cb = [
+    {"depth": 6,  "learning_rate": 0.05, "l2_leaf_reg": 3.0},
+    {"depth": 8,  "learning_rate": 0.05, "l2_leaf_reg": 3.0},
+    {"depth": 6,  "learning_rate": 0.1,  "l2_leaf_reg": 3.0},
+]
+
+best_cb = None
+best_auc = -np.inf
+best_params = None
+
+# Simple manual CV loop for small grid
+for params in param_grid_cb:
+    cb = CatBoostClassifier(
+        task_type="CPU",
+        iterations=2000,
+        early_stopping_rounds=100,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        class_weights=class_weights,
+        random_seed=SEED,
+        thread_count=THREADS,
+        verbose=False,
+        **params
+    )
+
+    cb.fit(X_train_cb, y_train, eval_set=(X_val_cb, y_val), use_best_model=True)
+    val_proba = cb.predict_proba(X_val_cb)[:, 1]
+    val_auc = roc_auc_score(y_val, val_proba)
+    if val_auc > best_auc:
+        best_auc = val_auc
+        best_cb = cb
+        best_params = params
+
+print("Best CatBoost params:", best_params)
+print("Validation ROC-AUC:", best_auc)
+
+# Compute validation PR-AUC and KS
+val_proba = best_cb.predict_proba(X_val_cb)[:, 1]
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_cb = float(thr[np.argmax(ks_vals)])
+print(f"Validation PR-AUC: {val_prauc:.4f}")
+print(f"Validation KS    : {ks:.4f} @ threshold {thr_ks_cb:.4f}")
+
+val_pred = (val_proba >= thr_ks_cb).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+
+# Retrain on TRAIN+VAL
+cb_final = CatBoostClassifier(
+    task_type="CPU",   # or "GPU"
+    iterations=2000,
+    early_stopping_rounds=100,
+    loss_function="Logloss",
+    eval_metric="AUC",
+    class_weights=class_weights,
+    random_seed=42,
+    verbose=False,
+    **best_params
+)
+X_trv_cb = pd.concat([X_train_cb, X_val_cb], copy=False)
+y_trv_cb = pd.concat([y_train, y_val], copy=False)
+cb_final.fit(X_trv_cb, y_trv_cb, use_best_model=False)
+
+# Test set evaluation
+test_proba = cb_final.predict_proba(X_test_cb)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+
+test_pred = (test_proba >= thr_ks_cb).astype(int)
+
+print("\n=== TEST RESULTS (CatBoost, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
+gc.collect()
+
+
+# ======================================================================================
+# Random Forest
+from sklearn.ensemble import RandomForestClassifier
+import os, gc
+
+# Trees don't need scaling, but they can't handle NaNs -> impute
+X_train_rf = X_train.astype(np.float32, copy=False)
+X_val_rf   = X_val.astype(np.float32,   copy=False)
+X_test_rf  = X_test.astype(np.float32,  copy=False)
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+pipe_rf = Pipeline([
+    ("imp", SimpleImputer(strategy="median")),
+    ("rf", RandomForestClassifier(
+        n_estimators=600,
+        max_depth=None,
+        max_features="sqrt",
+        min_samples_split=2,
+        min_samples_leaf=1,
+        class_weight="balanced_subsample",
+        n_jobs=THREADS,           # <- deterministic threads
+        random_state=SEED         # <- single source of truth
+    ))
+])
+
+# compact grid (8 combos)
+param_grid_rf = {
+    "rf__n_estimators": [400, 800],
+    "rf__max_depth": [None, 12],
+    "rf__min_samples_leaf": [1, 5],
+    "rf__max_features": ["sqrt", 0.5],
+}
+
+grid_rf = GridSearchCV(
+    estimator=pipe_rf,
+    param_grid=param_grid_rf,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=1,         # single process to avoid pickling large data during CV
+    verbose=1,
+    refit=True
+)
+
+# 1) Fit CV
+grid_rf.fit(X_train_rf, y_train)
+best_rf = grid_rf.best_estimator_
+print("Best RF params:", grid_rf.best_params_)
+print("CV ROC-AUC    :", grid_rf.best_score_)
+
+# 2) Validate — pick KS threshold
+val_proba = best_rf.predict_proba(X_val_rf)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_rf = float(thr[np.argmax(ks_vals)])
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_rf:.4f}")
+
+val_pred = (val_proba >= thr_ks_rf).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 3) Refit on TRAIN+VAL with best hyperparams
+best_rf_final = grid_rf.best_estimator_
+X_trv_rf = pd.concat([X_train_rf, X_val_rf], copy=False)
+y_trv_rf = pd.concat([y_train, y_val],       copy=False)
+best_rf_final.fit(X_trv_rf, y_trv_rf)
+del X_trv_rf, y_trv_rf
+gc.collect()
+
+# 4) Final TEST evaluation (use validation KS threshold)
+test_proba = best_rf_final.predict_proba(X_test_rf)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks_rf).astype(int)
+
+print("\n=== TEST RESULTS (Random Forest, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
+
+
+# ======================================================================================
+# Random Forest
+from sklearn.ensemble import RandomForestClassifier
+import os, gc
+
+# Trees don't need scaling, but they can't handle NaNs -> impute
+X_train_rf = X_train.astype(np.float32, copy=False)
+X_val_rf   = X_val.astype(np.float32,   copy=False)
+X_test_rf  = X_test.astype(np.float32,  copy=False)
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+pipe_rf = Pipeline([
+    ("imp", SimpleImputer(strategy="median")),
+    ("rf", RandomForestClassifier(
+        n_estimators=600,
+        max_depth=None,
+        max_features="sqrt",
+        min_samples_split=2,
+        min_samples_leaf=1,
+        class_weight="balanced_subsample",          # handle imbalance
+        n_jobs=max(1, os.cpu_count() // 2),
+        random_state=42
+    ))
+])
+
+# compact grid (8 combos)
+param_grid_rf = {
+    "rf__n_estimators": [400, 800],
+    "rf__max_depth": [None, 12],
+    "rf__min_samples_leaf": [1, 5],
+    "rf__max_features": ["sqrt", 0.5],
+}
+
+grid_rf = GridSearchCV(
+    estimator=pipe_rf,
+    param_grid=param_grid_rf,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=1,         # single process to avoid pickling large data during CV
+    verbose=1,
+    refit=True
+)
+
+# 1) Fit CV
+grid_rf.fit(X_train_rf, y_train)
+best_rf = grid_rf.best_estimator_
+print("Best RF params:", grid_rf.best_params_)
+print("CV ROC-AUC    :", grid_rf.best_score_)
+
+# 2) Validate — pick KS threshold
+val_proba = best_rf.predict_proba(X_val_rf)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_rf = float(thr[np.argmax(ks_vals)])
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_rf:.4f}")
+
+val_pred = (val_proba >= thr_ks_rf).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 3) Refit on TRAIN+VAL with best hyperparams
+best_rf_final = grid_rf.best_estimator_
+X_trv_rf = pd.concat([X_train_rf, X_val_rf], copy=False)
+y_trv_rf = pd.concat([y_train, y_val],       copy=False)
+best_rf_final.fit(X_trv_rf, y_trv_rf)
+del X_trv_rf, y_trv_rf
+gc.collect()
+
+# 4) Final TEST evaluation (use validation KS threshold)
+test_proba = best_rf_final.predict_proba(X_test_rf)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks_rf).astype(int)
+
+print("\n=== TEST RESULTS (Random Forest, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
+
+
+# ======================================================================================
+# Decision Tree
+from sklearn.tree import DecisionTreeClassifier
+import gc
+
+# Trees don't need scaling; still impute for any NaNs
+X_train_dt = X_train.astype(np.float32, copy=False)
+X_val_dt   = X_val.astype(np.float32,   copy=False)
+X_test_dt  = X_test.astype(np.float32,  copy=False)
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+pipe_dt = Pipeline([
+    ("imp", SimpleImputer(strategy="median")),
+    ("dt", DecisionTreeClassifier(
+        criterion="gini",
+        class_weight="balanced",
+        random_state=42
+    ))
+])
+
+param_grid_dt = {
+    "dt__max_depth": [None, 6, 12, 20],
+    "dt__min_samples_split": [2, 10],
+    "dt__min_samples_leaf": [1, 5, 20],
+    "dt__max_features": [None, "sqrt"],
+    "dt__ccp_alpha": [0.0, 0.001]  # minimal cost-complexity pruning
+}
+
+grid_dt = GridSearchCV(
+    estimator=pipe_dt,
+    param_grid=param_grid_dt,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=1,        # avoid heavy pickling across processes
+    verbose=1,
+    refit=True
+)
+
+# 1) Fit CV
+grid_dt.fit(X_train_dt, y_train)
+best_dt = grid_dt.best_estimator_
+print("Best DT params:", grid_dt.best_params_)
+print("CV ROC-AUC    :", grid_dt.best_score_)
+
+# 2) Validate — pick KS threshold
+val_proba = best_dt.predict_proba(X_val_dt)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_dt = float(thr[np.argmax(ks_vals)])
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_dt:.4f}")
+
+val_pred = (val_proba >= thr_ks_dt).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 3) Refit on TRAIN+VAL with best hyperparams
+best_dt_final = grid_dt.best_estimator_
+X_trv_dt = pd.concat([X_train_dt, X_val_dt], copy=False)
+y_trv_dt = pd.concat([y_train, y_val],      copy=False)
+best_dt_final.fit(X_trv_dt, y_trv_dt)
+del X_trv_dt, y_trv_dt
+gc.collect()
+
+# 4) Final TEST evaluation (use validation KS threshold)
+test_proba = best_dt_final.predict_proba(X_test_dt)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks_dt).astype(int)
+
+print("\n=== TEST RESULTS (Decision Tree, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
+
+# Optional: top feature importances
+fi_dt = best_dt_final.named_steps["dt"].feature_importances_
+top_dt = pd.Series(fi_dt, index=X.columns).sort_values(ascending=False).head(15)
+print("\nTop 15 Decision Tree feature importances:\n", top_dt)
