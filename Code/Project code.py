@@ -635,3 +635,112 @@ plt.legend()
 plt.tight_layout()
 plt.savefig("ks_test.png", dpi=200)
 plt.show()
+
+
+# ================================================================================
+# QRM ADD-ON: Portfolio VaR & ES from PDs (Monte Carlo, Gaussian copula)
+# Place this block directly AFTER your existing code (after the ROC/PR/KS plots).
+# ================================================================================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import sqrt
+from scipy.stats import norm
+
+rng = np.random.default_rng(SEED)
+
+# ---------- 1) Portfolio setup (adjust if you have real EAD/LGD) ----------
+N = len(next(iter(probas.values())))            # number of test accounts
+EAD_const = 1000.0                               # constant exposure per account ($)
+# Fixed LGD per account from Beta(2,5) ~ mean 0.286
+LGD = rng.beta(2.0, 5.0, size=N).astype(np.float64)
+
+# Effective per-account loss weight
+W = EAD_const * LGD  # shape (N,)
+
+# ---------- 2) Bin accounts by PD ----------
+def make_pd_bins(p, w, n_bins=200):
+    """Return per-bin counts, avg PD, and avg exposure-per-default occurrence."""
+    p = np.asarray(p, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    n = len(p)
+    n_bins = int(min(n_bins, max(1, n)))  # cap at N
+    order = np.argsort(p)
+    bins = np.array_split(order, n_bins)
+    n_b = np.array([len(b) for b in bins], dtype=np.int32)
+    n_b = np.where(n_b == 0, 1, n_b)
+    p_b = np.array([p[b].mean() for b in bins], dtype=np.float64)
+    e_b = np.array([w[b].sum() / max(len(b), 1) for b in bins], dtype=np.float64)
+    return n_b, p_b, e_b
+
+# ---------- 3) Simulator ----------
+def simulate_losses_binomial(n_b, p_b, e_b, sims=20000, rho=0.0, batch=2000, seed=SEED):
+    """Monte Carlo portfolio loss using per-bin binomial draws.
+       rho=0: independent defaults; rho>0: one-factor Gaussian copula."""
+    rng = np.random.default_rng(seed)
+    a_b = norm.ppf(np.clip(p_b, 1e-12, 1-1e-12))
+    B = len(n_b)
+    out = np.empty(sims, dtype=np.float64)
+    i = 0
+    while i < sims:
+        m = min(batch, sims - i)
+        if rho <= 0.0:
+            D = rng.binomial(n=n_b, p=p_b, size=(m, B)).astype(np.float64)
+        else:
+            F = rng.standard_normal(size=m)  # common factor
+            z = (a_b[None, :] - sqrt(rho) * F[:, None]) / sqrt(max(1e-12, 1.0 - rho))
+            p_cond = norm.cdf(z)
+            D = rng.binomial(n=n_b[None, :], p=p_cond).astype(np.float64)
+        out[i:i+m] = D.dot(e_b)
+        i += m
+    return out
+
+def var_es(x, alpha=0.99):
+    """Return (VaR_alpha, ES_alpha) for array x of losses."""
+    x = np.sort(np.asarray(x, dtype=np.float64))
+    n = x.size
+    k = int(np.ceil(alpha * n)) - 1
+    k = max(0, min(k, n-1))
+    VaR = x[k]
+    ES = x[k:].mean() if k < n else x[-1]
+    return float(VaR), float(ES)
+
+# ---------- 4) Run sims & summary ----------
+rhos = [0.0, 0.1, 0.3, 0.5]
+alpha_levels = [0.975, 0.99]
+rows = []
+cdf_for_plot = {}
+
+for model_name, p in probas.items():
+    p = np.asarray(p, dtype=np.float64)
+    n_b, p_b, e_b = make_pd_bins(p, W, n_bins=200)
+    for rho in rhos:
+        losses = simulate_losses_binomial(n_b, p_b, e_b, sims=20000, rho=rho, batch=2000, seed=SEED+int(1000*rho))
+        el = float(losses.mean())
+        for a in alpha_levels:
+            VaR, ES = var_es(losses, alpha=a)
+            rows.append([model_name, rho, a, el, VaR, ES])
+        if abs(rho - 0.30) < 1e-9:
+            cdf_for_plot[model_name] = np.sort(losses)
+
+qrm_df = pd.DataFrame(rows, columns=["Model", "Rho", "Alpha", "ExpectedLoss", "VaR", "ES"])
+print("\n=== Portfolio Risk (Monte Carlo, 20k sims per rho) ===")
+print(qrm_df.sort_values(["Rho", "Alpha", "VaR"], ascending=[True, True, False]).to_string(index=False))
+qrm_df.to_csv("qrm_var_es_summary.csv", index=False)
+
+# ---------- 5) Plot overlay loss CDFs at rho=0.30 ----------
+plt.figure()
+for name, xs in cdf_for_plot.items():
+    n = xs.size
+    u = np.linspace(0, 1, n, endpoint=False)
+    plt.plot(xs, u, label=name)
+plt.xlabel("Portfolio Loss")
+plt.ylabel("Empirical CDF")
+plt.title("Loss CDF on TEST (rho = 0.30)")
+plt.legend()
+plt.tight_layout()
+plt.savefig("loss_cdf_rho0.30.png", dpi=200)
+plt.show()
+
+print("\nSaved: qrm_var_es_summary.csv, loss_cdf_rho0.30.png")
+# ================================================================================
