@@ -18,23 +18,92 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 random.seed(SEED)
 # ===============================================================================
 
-
-
-
-import pandas as pd
+import gc
 import numpy as np
+import pandas as pd
+
+from pathlib import Path
 
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
+    confusion_matrix, classification_report
+)
+
+# ====================== UNIFIED REPORTING HELPERS ======================
+
+def _ks_from_proba(y_true, proba):
+    fpr, tpr, thr = roc_curve(y_true, proba)
+    ks_vals = tpr - fpr
+    i = int(np.argmax(ks_vals))
+    return float(ks_vals[i]), float(thr[i])
+
+def _evaluate_block(y_true, proba, thr):
+    auc   = float(roc_auc_score(y_true, proba))
+    prauc = float(average_precision_score(y_true, proba))
+    fpr, tpr, _ = roc_curve(y_true, proba)
+    ks = float(np.max(tpr - fpr))
+    pred = (proba >= thr).astype(int)
+    cm = confusion_matrix(y_true, pred)
+    rpt = classification_report(y_true, pred, digits=4)
+    return auc, prauc, ks, cm, rpt
+
+def print_model_report(
+    name,
+    cv_best_params,
+    cv_best_score,
+    val_proba, y_val,
+    test_proba, y_test,
+):
+    print(f"\n=== {name} CV ===")
+    if cv_best_params is not None:
+        print(f"Best params: {cv_best_params}")
+    else:
+        print("Best params: (n/a)")
+    if cv_best_score is not None:
+        print(f"CV ROC-AUC (mean): {cv_best_score:.6f}")
+    else:
+        print("CV ROC-AUC (mean): (n/a)")
+
+    ks_val, thr_ks = _ks_from_proba(y_val, val_proba)
+    val_auc, val_prauc, _, val_cm, val_rpt = _evaluate_block(y_val, val_proba, thr_ks)
+
+    print(f"\n=== {name} VALIDATION ===")
+    print(f"Validation ROC-AUC: {val_auc:.4f}")
+    print(f"Validation PR-AUC : {val_prauc:.4f}")
+    print(f"Validation KS     : {ks_val:.4f} @ threshold {thr_ks:.4f}")
+    print("\nValidation Confusion Matrix:")
+    print(val_cm)
+    print("\nValidation Classification Report:")
+    print(val_rpt)
+
+    test_auc, test_prauc, ks_test, test_cm, test_rpt = _evaluate_block(y_test, test_proba, thr_ks)
+
+    print(f"\n=== {name} TEST (using validation KS threshold) ===")
+    print(f"Test ROC-AUC: {test_auc:.4f}")
+    print(f"Test PR-AUC : {test_prauc:.4f}")
+    print(f"Test KS     : {ks_test:.4f}")
+    print("\nTest Confusion Matrix:")
+    print(test_cm)
+    print("\nTest Classification Report:")
+    print(test_rpt)
+
+    return thr_ks
+# ======================================================================
 
 
 # --- file paths (edit TEST_PATH if needed) ---
-#   r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
-#   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
+#  r"H:\\git\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv"
+#  r"D:\\Github\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv"
 
 # === 1. Load Data & Data Pre-processing ===
 #  File location for developers:
-
-df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+#  NOTE: Keep your original path; adjust if running elsewhere.
+df = pd.read_csv(r"H:\\git\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -86,7 +155,6 @@ dr_series.loc[normal_income] = np.clip(dr_series.loc[normal_income], 0.0, REALIS
 dr_series = dr_series.fillna(np.nanmedian(dr_series.values))
 df["DebtRatio"] = dr_series.astype(float)
 
-
 # NumberOfDependents: flag missing, top-code, impute median, large-family flag ===
 dep_na_mask = df["NumberOfDependents"].isna()
 df["DependentsMissingFlag"] = dep_na_mask.astype("int8")
@@ -99,7 +167,7 @@ dep_series = dep_series.fillna(dep_median).astype("int8")
 
 df["NumberOfDependents"] = dep_series
 df["LargeFamilyFlag"] = (df["NumberOfDependents"] >= 5).astype("int8")
- 
+
 # Number of Times Past Due Clean up
 cols_past_due = [
     "NumberOfTime30-59DaysPastDueNotWorse",
@@ -110,33 +178,22 @@ cols_past_due = [
 for col in cols_past_due:
     # Ensure numeric
     df[col] = pd.to_numeric(df[col], errors="coerce")
-    
     # Missing flag for special codes
     df[f"{col}_MissingFlag"] = df[col].isin([96, 98]).astype(int)
-    
     # Replace special codes with NaN
     df[col] = df[col].replace({96: np.nan, 98: np.nan})
-    
     # Calculate median from valid (non-NaN) values
     median_val = df[col].median(skipna=True)
-    
     # Fill NaN with median
     df[col] = df[col].fillna(median_val)
-    
     # Cap extreme real values
     df[col] = np.where(df[col] > 10, 10, df[col]).astype(int)
 
-# Export cleaned data 
-# df.to_csv(r"F:\Waterloo\Actsc\Actsc 445\Project\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training-clean.csv", index=False)
-
 # === 2. Split the dataset ===
-from sklearn.model_selection import train_test_split
-
 # Suppose df is already cleaned
 TARGET = "SeriousDlqin2yrs"
 X = df.drop(columns=[TARGET])
 y = df[TARGET].astype(int)
-
 
 # First split into train+val and test (stratified)
 X_trainval, X_test, y_trainval, y_test = train_test_split(
@@ -147,7 +204,6 @@ X_train, X_val, y_train, y_val = train_test_split(
 )
 
 # ---------------- Persist splits so future runs use identical rows --------------
-from pathlib import Path
 split_dir = Path("./_splits"); split_dir.mkdir(exist_ok=True)
 f_train = split_dir / "train_idx.npy"
 f_val   = split_dir / "val_idx.npy"
@@ -168,17 +224,8 @@ else:
     np.save(f_test,  X_test.index.values)
 # ------------------------------------------------------------------------------
 
-
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
-    confusion_matrix, classification_report
-)
-
-# L1 needs scaling for stable coefficients; StandardScaler is fine for all-numeric data
+# ======================================================================================
+# L1 Logistic Regression (with scaling)
 pipe = Pipeline(steps=[
     ("scaler", StandardScaler()),
     ("clf", LogisticRegression(
@@ -191,49 +238,28 @@ pipe = Pipeline(steps=[
     ))
 ])
 
-param_grid = {
-    "clf__C": np.logspace(-3, 1, 9)  # 0.001 ... 10
-}
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
 
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+param_grid = {
+    "clf__C": np.logspace(-3, 1, 16)  # 16 candidates
+}
 
 grid = GridSearchCV(
     estimator=pipe,
     param_grid=param_grid,
     scoring="roc_auc",
     cv=cv,
-    n_jobs=-1,
+    n_jobs=1,            # keep deterministic; set >1 if you want faster CV
     verbose=1
 )
 
 grid.fit(X_train, y_train)
 best_model = grid.best_estimator_
-print("Best C:", grid.best_params_["clf__C"])
-print("CV ROC-AUC (mean):", grid.best_score_)
 
-# ===== 6) Validate on VAL set =====
-val_proba = best_model.predict_proba(X_val)[:, 1]
-val_auc   = roc_auc_score(y_val, val_proba)
-val_prauc = average_precision_score(y_val, val_proba)
+# VALIDATION probabilities from CV-best model
+val_proba_logit = best_model.predict_proba(X_val)[:, 1]
 
-# KS statistic (max TPR-FPR)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = np.max(ks_vals)
-thr_ks = thr[np.argmax(ks_vals)]
-
-print(f"Validation ROC-AUC: {val_auc:.4f}")
-print(f"Validation PR-AUC : {val_prauc:.4f}")
-print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
-
-# Choose threshold by max KS on validation
-val_pred = (val_proba >= thr_ks).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-
-# ===== 7) Retrain on TRAIN+VAL with best hyperparams, then evaluate on TEST =====
+# Retrain on TRAIN+VAL with best C for TEST probabilities
 best_model_final = GridSearchCV(
     estimator=pipe,
     param_grid={"clf__C": [grid.best_params_["clf__C"]]},
@@ -242,42 +268,31 @@ best_model_final = GridSearchCV(
     n_jobs=-1
 ).fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val])).best_estimator_
 
-test_proba = best_model_final.predict_proba(X_test)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = np.max(tpr_t - fpr_t)
+test_proba_logit = best_model_final.predict_proba(X_test)[:, 1]
 
-# Use the threshold chosen on validation (thr_ks) for fair final metrics
-test_pred = (test_proba >= thr_ks).astype(int)
-
-print("\n=== TEST RESULTS (using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
-
+_ = print_model_report(
+    name="L1-Logit",
+    cv_best_params=grid.best_params_,
+    cv_best_score=grid.best_score_,
+    val_proba=val_proba_logit, y_val=y_val,
+    test_proba=test_proba_logit, y_test=y_test
+)
 
 # ======================================================================================
 # XGBoost
-import os, gc, numpy as np, pandas as pd
 from xgboost import XGBClassifier
 
-# 0) Reduce footprint: use float32 (no copy if already float32)
-X_train = X_train.astype(np.float32, copy=False)
-X_val   = X_val.astype(np.float32,   copy=False)
-X_test  = X_test.astype(np.float32,  copy=False)
+# Reduce footprint: use float32 (no copy if already float32)
+X_train_xgb = X_train.astype(np.float32, copy=False)
+X_val_xgb   = X_val.astype(np.float32,   copy=False)
+X_test_xgb  = X_test.astype(np.float32,  copy=False)
 
-# 1) CV setup (smaller grid + 3-fold to save memory)
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+# CV setup (smaller grid + 3-fold to save memory)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
 pos, neg = int((y_train == 1).sum()), int((y_train == 0).sum())
 scale_pos_weight = neg / max(pos, 1)
 
 pipe_xgb = Pipeline([
-    # trees don't need scaling, but we must impute missing values
     ("imp", SimpleImputer(strategy="median")),
     ("xgb", XGBClassifier(
         objective="binary:logistic",
@@ -298,7 +313,6 @@ pipe_xgb = Pipeline([
     ))
 ])
 
-# compact grid (8 combos)
 param_grid_xgb = {
     "xgb__n_estimators": [400, 800],
     "xgb__max_depth": [4, 6],
@@ -309,74 +323,42 @@ param_grid_xgb = {
 grid_xgb = GridSearchCV(
     estimator=pipe_xgb,
     param_grid=param_grid_xgb,
-    scoring="roc_auc",     # keep identical to your L1 setup
+    scoring="roc_auc",
     cv=cv,
-    n_jobs=1,              # <<< single process to avoid pickling big data
+    n_jobs=1,
     verbose=1,
     refit=True
 )
 
-# 2) Fit CV
-grid_xgb.fit(X_train, y_train)
+grid_xgb.fit(X_train_xgb, y_train)
 best_xgb = grid_xgb.best_estimator_
-print("Best params:", grid_xgb.best_params_)
-print("CV ROC-AUC :", grid_xgb.best_score_)
-gc.collect()
 
-# 3) Validate on VAL — get KS threshold
-val_proba = best_xgb.predict_proba(X_val)[:, 1]
-val_auc   = roc_auc_score(y_val, val_proba)
-val_prauc = average_precision_score(y_val, val_proba)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = float(np.max(ks_vals))
-thr_ks = float(thr[np.argmax(ks_vals)])
+# VALIDATION proba
+val_proba_xgb = best_xgb.predict_proba(X_val_xgb)[:, 1]
 
-print(f"Validation ROC-AUC: {val_auc:.4f}")
-print(f"Validation PR-AUC : {val_prauc:.4f}")
-print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
-
-val_pred = (val_proba >= thr_ks).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-del val_proba, fpr, tpr, thr, ks_vals
-gc.collect()
-
-# 4) Refit on TRAIN+VAL with best hyperparams (no extra CV)
+# Refit on TRAIN+VAL (no extra CV)
 best_xgb_final = grid_xgb.best_estimator_
-X_trv = pd.concat([X_train, X_val], copy=False)
+X_trv = pd.concat([X_train_xgb, X_val_xgb], copy=False)
 y_trv = pd.concat([y_train, y_val], copy=False)
 best_xgb_final.fit(X_trv, y_trv)
 del X_trv, y_trv
 gc.collect()
 
-# 5) Final TEST evaluation (use validation KS threshold)
-test_proba = best_xgb_final.predict_proba(X_test)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = float(np.max(tpr_t - fpr_t))
+# TEST proba
+test_proba_xgb = best_xgb_final.predict_proba(X_test_xgb)[:, 1]
 
-test_pred = (test_proba >= thr_ks).astype(int)
-
-print("\n=== TEST RESULTS (using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
-
+_ = print_model_report(
+    name="XGBoost",
+    cv_best_params=grid_xgb.best_params_,
+    cv_best_score=grid_xgb.best_score_,
+    val_proba=val_proba_xgb, y_val=y_val,
+    test_proba=test_proba_xgb, y_test=y_test
+)
 
 # ======================================================================================
 # CatBoost
 from catboost import CatBoostClassifier
-import gc
 
-# Convert to float32 (CatBoost handles its own NaN imputation)
 X_train_cb = X_train.copy()
 X_val_cb   = X_val.copy()
 X_test_cb  = X_test.copy()
@@ -411,43 +393,27 @@ for params in param_grid_cb:
         verbose=False,
         **params
     )
-
     cb.fit(X_train_cb, y_train, eval_set=(X_val_cb, y_val), use_best_model=True)
-    val_proba = cb.predict_proba(X_val_cb)[:, 1]
-    val_auc = roc_auc_score(y_val, val_proba)
-    if val_auc > best_auc:
-        best_auc = val_auc
+    vproba = cb.predict_proba(X_val_cb)[:, 1]
+    vauc = roc_auc_score(y_val, vproba)
+    if vauc > best_auc:
+        best_auc = vauc
         best_cb = cb
         best_params = params
 
-print("Best CatBoost params:", best_params)
-print("Validation ROC-AUC:", best_auc)
+# VALIDATION proba from best model
+val_proba_cb = best_cb.predict_proba(X_val_cb)[:, 1]
 
-# Compute validation PR-AUC and KS
-val_proba = best_cb.predict_proba(X_val_cb)[:, 1]
-val_prauc = average_precision_score(y_val, val_proba)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = float(np.max(ks_vals))
-thr_ks_cb = float(thr[np.argmax(ks_vals)])
-print(f"Validation PR-AUC: {val_prauc:.4f}")
-print(f"Validation KS    : {ks:.4f} @ threshold {thr_ks_cb:.4f}")
-
-val_pred = (val_proba >= thr_ks_cb).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-
-# Retrain on TRAIN+VAL
+# Retrain FINAL on TRAIN+VAL
 cb_final = CatBoostClassifier(
-    task_type="CPU",   # or "GPU"
+    task_type="CPU",
     iterations=2000,
     early_stopping_rounds=100,
     loss_function="Logloss",
     eval_metric="AUC",
     class_weights=class_weights,
-    random_seed=42,
+    random_seed=SEED,
+    thread_count=THREADS,
     verbose=False,
     **best_params
 )
@@ -455,37 +421,28 @@ X_trv_cb = pd.concat([X_train_cb, X_val_cb], copy=False)
 y_trv_cb = pd.concat([y_train, y_val], copy=False)
 cb_final.fit(X_trv_cb, y_trv_cb, use_best_model=False)
 
-# Test set evaluation
-test_proba = cb_final.predict_proba(X_test_cb)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = float(np.max(tpr_t - fpr_t))
+# TEST proba
+test_proba_cb = cb_final.predict_proba(X_test_cb)[:, 1]
 
-test_pred = (test_proba >= thr_ks_cb).astype(int)
+_ = print_model_report(
+    name="CatBoost",
+    cv_best_params=best_params,
+    cv_best_score=best_auc,   # using best validation AUC from the simple grid loop
+    val_proba=val_proba_cb, y_val=y_val,
+    test_proba=test_proba_cb, y_test=y_test
+)
 
-print("\n=== TEST RESULTS (CatBoost, using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
 gc.collect()
-
 
 # ======================================================================================
 # Random Forest
 from sklearn.ensemble import RandomForestClassifier
-import os, gc
 
-# Trees don't need scaling, but they can't handle NaNs -> impute
 X_train_rf = X_train.astype(np.float32, copy=False)
 X_val_rf   = X_val.astype(np.float32,   copy=False)
 X_test_rf  = X_test.astype(np.float32,  copy=False)
 
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
 
 pipe_rf = Pipeline([
     ("imp", SimpleImputer(strategy="median")),
@@ -496,12 +453,11 @@ pipe_rf = Pipeline([
         min_samples_split=2,
         min_samples_leaf=1,
         class_weight="balanced_subsample",
-        n_jobs=THREADS,           # <- deterministic threads
-        random_state=SEED         # <- single source of truth
+        n_jobs=max(1, os.cpu_count() // 2),
+        random_state=SEED
     ))
 ])
 
-# compact grid (8 combos)
 param_grid_rf = {
     "rf__n_estimators": [400, 800],
     "rf__max_depth": [None, 12],
@@ -514,39 +470,18 @@ grid_rf = GridSearchCV(
     param_grid=param_grid_rf,
     scoring="roc_auc",
     cv=cv,
-    n_jobs=1,         # single process to avoid pickling large data during CV
+    n_jobs=1,
     verbose=1,
     refit=True
 )
 
-# 1) Fit CV
 grid_rf.fit(X_train_rf, y_train)
 best_rf = grid_rf.best_estimator_
-print("Best RF params:", grid_rf.best_params_)
-print("CV ROC-AUC    :", grid_rf.best_score_)
 
-# 2) Validate — pick KS threshold
-val_proba = best_rf.predict_proba(X_val_rf)[:, 1]
-val_auc   = roc_auc_score(y_val, val_proba)
-val_prauc = average_precision_score(y_val, val_proba)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = float(np.max(ks_vals))
-thr_ks_rf = float(thr[np.argmax(ks_vals)])
+# VALIDATION proba
+val_proba_rf = best_rf.predict_proba(X_val_rf)[:, 1]
 
-print(f"Validation ROC-AUC: {val_auc:.4f}")
-print(f"Validation PR-AUC : {val_prauc:.4f}")
-print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_rf:.4f}")
-
-val_pred = (val_proba >= thr_ks_rf).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-del val_proba, fpr, tpr, thr, ks_vals
-gc.collect()
-
-# 3) Refit on TRAIN+VAL with best hyperparams
+# Refit on TRAIN+VAL
 best_rf_final = grid_rf.best_estimator_
 X_trv_rf = pd.concat([X_train_rf, X_val_rf], copy=False)
 y_trv_rf = pd.concat([y_train, y_val],       copy=False)
@@ -554,39 +489,97 @@ best_rf_final.fit(X_trv_rf, y_trv_rf)
 del X_trv_rf, y_trv_rf
 gc.collect()
 
-# 4) Final TEST evaluation (use validation KS threshold)
-test_proba = best_rf_final.predict_proba(X_test_rf)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = float(np.max(tpr_t - fpr_t))
-test_pred = (test_proba >= thr_ks_rf).astype(int)
+# TEST proba
+test_proba_rf = best_rf_final.predict_proba(X_test_rf)[:, 1]
 
-print("\n=== TEST RESULTS (Random Forest, using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
+_ = print_model_report(
+    name="Random Forest",
+    cv_best_params=grid_rf.best_params_,
+    cv_best_score=grid_rf.best_score_,
+    val_proba=val_proba_rf, y_val=y_val,
+    test_proba=test_proba_rf, y_test=y_test
+)
 
-# ================================================================================
-# === PLOTS: ROC / PR / KS on TEST for 4 models (Logit L1, XGB, CatBoost, RF) ===
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score
-import numpy as np
-import pandas as pd
+# ======================================================================================
+# Decision Tree
+from sklearn.tree import DecisionTreeClassifier
 
-# 1) Collect test-set probabilities (use the same matrices each model used above)
-probas = {
-    "L1-Logit":   best_model_final.predict_proba(X_test)[:, 1],
-    "XGBoost":    best_xgb_final.predict_proba(X_test)[:, 1],
-    "CatBoost":   cb_final.predict_proba(X_test_cb)[:, 1],
-    "RandomForest": best_rf_final.predict_proba(X_test_rf)[:, 1],
+X_train_dt = X_train.astype(np.float32, copy=False)
+X_val_dt   = X_val.astype(np.float32,   copy=False)
+X_test_dt  = X_test.astype(np.float32,  copy=False)
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+
+pipe_dt = Pipeline([
+    ("imp", SimpleImputer(strategy="median")),
+    ("dt", DecisionTreeClassifier(
+        criterion="gini",
+        class_weight="balanced",
+        random_state=SEED
+    ))
+])
+
+param_grid_dt = {
+    "dt__max_depth": [None, 6, 12, 20],
+    "dt__min_samples_split": [2, 10],
+    "dt__min_samples_leaf": [1, 5, 20],
+    "dt__max_features": [None, "sqrt"],
+    "dt__ccp_alpha": [0.0, 0.001]
 }
 
-# 2) Summary table: AUC / PR-AUC / KS (max TPR-FPR)
+grid_dt = GridSearchCV(
+    estimator=pipe_dt,
+    param_grid=param_grid_dt,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=1,
+    verbose=1,
+    refit=True
+)
+
+grid_dt.fit(X_train_dt, y_train)
+best_dt = grid_dt.best_estimator_
+
+# VALIDATION proba
+val_proba_dt = best_dt.predict_proba(X_val_dt)[:, 1]
+
+# Refit on TRAIN+VAL
+best_dt_final = grid_dt.best_estimator_
+X_trv_dt = pd.concat([X_train_dt, X_val_dt], copy=False)
+y_trv_dt = pd.concat([y_train, y_val],      copy=False)
+best_dt_final.fit(X_trv_dt, y_trv_dt)
+del X_trv_dt, y_trv_dt
+gc.collect()
+
+# TEST proba
+test_proba_dt = best_dt_final.predict_proba(X_test_dt)[:, 1]
+
+_ = print_model_report(
+    name="Decision Tree",
+    cv_best_params=grid_dt.best_params_,
+    cv_best_score=grid_dt.best_score_,
+    val_proba=val_proba_dt, y_val=y_val,
+    test_proba=test_proba_dt, y_test=y_test
+)
+
+# Optional: top feature importances
+fi_dt = best_dt_final.named_steps["dt"].feature_importances_
+top_dt = pd.Series(fi_dt, index=X.columns).sort_values(ascending=False).head(15)
+print("\nTop 15 Decision Tree feature importances:\n", top_dt)
+
+# ================================================================================
+# === PLOTS: ROC / PR / KS on TEST for 5 models ===
+import matplotlib.pyplot as plt
+
+probas = {
+    "L1-Logit":     test_proba_logit,
+    "XGBoost":      test_proba_xgb,
+    "CatBoost":     test_proba_cb,
+    "RandomForest": test_proba_rf,
+    "DecisionTree": test_proba_dt,
+}
+
+# Summary table: AUC / PR-AUC / KS (max TPR-FPR)
 summary_rows = []
 ks_curves = {}  # store (thr, ks_vals) for plotting
 for name, p in probas.items():
@@ -604,7 +597,7 @@ summary = pd.DataFrame(summary_rows, columns=["Model", "ROC-AUC", "PR-AUC", "KS"
 print("\n=== TEST summary ===")
 print(summary.to_string(index=False))
 
-# 3) ROC curve (combined)
+# ROC curve (combined)
 plt.figure()
 for name, p in probas.items():
     fpr, tpr, _ = roc_curve(y_test, p)
@@ -618,7 +611,7 @@ plt.tight_layout()
 plt.savefig("roc_test.png", dpi=200)
 plt.show()
 
-# 4) PR curve (combined)
+# PR curve (combined)
 plt.figure()
 for name, p in probas.items():
     prec, rec, _ = precision_recall_curve(y_test, p)
@@ -631,7 +624,7 @@ plt.tight_layout()
 plt.savefig("pr_test.png", dpi=200)
 plt.show()
 
-# 5) KS curve (combined): plot KS = TPR - FPR vs threshold
+# KS curve (combined)
 plt.figure()
 for name, (thr, ks_vals) in ks_curves.items():
     plt.plot(thr, ks_vals, label=f"{name}")
