@@ -34,7 +34,7 @@ from sklearn.impute import SimpleImputer
 # === 1. Load Data & Data Pre-processing ===
 #  File location for developers:
 
-df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -571,196 +571,74 @@ print(confusion_matrix(y_test, test_pred))
 print("\nTest Classification Report:")
 print(classification_report(y_test, test_pred, digits=4))
 
+# ================================================================================
+# === PLOTS: ROC / PR / KS on TEST for 4 models (Logit L1, XGB, CatBoost, RF) ===
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score
+import numpy as np
+import pandas as pd
 
-# ======================================================================================
-# Random Forest
-from sklearn.ensemble import RandomForestClassifier
-import os, gc
-
-# Trees don't need scaling, but they can't handle NaNs -> impute
-X_train_rf = X_train.astype(np.float32, copy=False)
-X_val_rf   = X_val.astype(np.float32,   copy=False)
-X_test_rf  = X_test.astype(np.float32,  copy=False)
-
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-
-pipe_rf = Pipeline([
-    ("imp", SimpleImputer(strategy="median")),
-    ("rf", RandomForestClassifier(
-        n_estimators=600,
-        max_depth=None,
-        max_features="sqrt",
-        min_samples_split=2,
-        min_samples_leaf=1,
-        class_weight="balanced_subsample",          # handle imbalance
-        n_jobs=max(1, os.cpu_count() // 2),
-        random_state=42
-    ))
-])
-
-# compact grid (8 combos)
-param_grid_rf = {
-    "rf__n_estimators": [400, 800],
-    "rf__max_depth": [None, 12],
-    "rf__min_samples_leaf": [1, 5],
-    "rf__max_features": ["sqrt", 0.5],
+# 1) Collect test-set probabilities (use the same matrices each model used above)
+probas = {
+    "L1-Logit":   best_model_final.predict_proba(X_test)[:, 1],
+    "XGBoost":    best_xgb_final.predict_proba(X_test)[:, 1],
+    "CatBoost":   cb_final.predict_proba(X_test_cb)[:, 1],
+    "RandomForest": best_rf_final.predict_proba(X_test_rf)[:, 1],
 }
 
-grid_rf = GridSearchCV(
-    estimator=pipe_rf,
-    param_grid=param_grid_rf,
-    scoring="roc_auc",
-    cv=cv,
-    n_jobs=1,         # single process to avoid pickling large data during CV
-    verbose=1,
-    refit=True
-)
+# 2) Summary table: AUC / PR-AUC / KS (max TPR-FPR)
+summary_rows = []
+ks_curves = {}  # store (thr, ks_vals) for plotting
+for name, p in probas.items():
+    fpr, tpr, thr = roc_curve(y_test, p)
+    ks_vals = tpr - fpr
+    ks = float(np.max(ks_vals))
+    thr_ks = float(thr[np.argmax(ks_vals)])
+    auc = float(roc_auc_score(y_test, p))
+    pr_auc = float(average_precision_score(y_test, p))
+    summary_rows.append([name, auc, pr_auc, ks, thr_ks])
+    ks_curves[name] = (thr, ks_vals)
 
-# 1) Fit CV
-grid_rf.fit(X_train_rf, y_train)
-best_rf = grid_rf.best_estimator_
-print("Best RF params:", grid_rf.best_params_)
-print("CV ROC-AUC    :", grid_rf.best_score_)
+summary = pd.DataFrame(summary_rows, columns=["Model", "ROC-AUC", "PR-AUC", "KS", "KS_threshold"]) \
+            .sort_values("ROC-AUC", ascending=False)
+print("\n=== TEST summary ===")
+print(summary.to_string(index=False))
 
-# 2) Validate — pick KS threshold
-val_proba = best_rf.predict_proba(X_val_rf)[:, 1]
-val_auc   = roc_auc_score(y_val, val_proba)
-val_prauc = average_precision_score(y_val, val_proba)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = float(np.max(ks_vals))
-thr_ks_rf = float(thr[np.argmax(ks_vals)])
+# 3) ROC curve (combined)
+plt.figure()
+for name, p in probas.items():
+    fpr, tpr, _ = roc_curve(y_test, p)
+    plt.plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_test, p):.3f})")
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curves on TEST")
+plt.legend()
+plt.tight_layout()
+plt.savefig("roc_test.png", dpi=200)
+plt.show()
 
-print(f"Validation ROC-AUC: {val_auc:.4f}")
-print(f"Validation PR-AUC : {val_prauc:.4f}")
-print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_rf:.4f}")
+# 4) PR curve (combined)
+plt.figure()
+for name, p in probas.items():
+    prec, rec, _ = precision_recall_curve(y_test, p)
+    plt.plot(rec, prec, label=f"{name} (PR-AUC={average_precision_score(y_test, p):.3f})")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision–Recall Curves on TEST")
+plt.legend()
+plt.tight_layout()
+plt.savefig("pr_test.png", dpi=200)
+plt.show()
 
-val_pred = (val_proba >= thr_ks_rf).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-del val_proba, fpr, tpr, thr, ks_vals
-gc.collect()
-
-# 3) Refit on TRAIN+VAL with best hyperparams
-best_rf_final = grid_rf.best_estimator_
-X_trv_rf = pd.concat([X_train_rf, X_val_rf], copy=False)
-y_trv_rf = pd.concat([y_train, y_val],       copy=False)
-best_rf_final.fit(X_trv_rf, y_trv_rf)
-del X_trv_rf, y_trv_rf
-gc.collect()
-
-# 4) Final TEST evaluation (use validation KS threshold)
-test_proba = best_rf_final.predict_proba(X_test_rf)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = float(np.max(tpr_t - fpr_t))
-test_pred = (test_proba >= thr_ks_rf).astype(int)
-
-print("\n=== TEST RESULTS (Random Forest, using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
-
-
-# ======================================================================================
-# Decision Tree
-from sklearn.tree import DecisionTreeClassifier
-import gc
-
-# Trees don't need scaling; still impute for any NaNs
-X_train_dt = X_train.astype(np.float32, copy=False)
-X_val_dt   = X_val.astype(np.float32,   copy=False)
-X_test_dt  = X_test.astype(np.float32,  copy=False)
-
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-
-pipe_dt = Pipeline([
-    ("imp", SimpleImputer(strategy="median")),
-    ("dt", DecisionTreeClassifier(
-        criterion="gini",
-        class_weight="balanced",
-        random_state=42
-    ))
-])
-
-param_grid_dt = {
-    "dt__max_depth": [None, 6, 12, 20],
-    "dt__min_samples_split": [2, 10],
-    "dt__min_samples_leaf": [1, 5, 20],
-    "dt__max_features": [None, "sqrt"],
-    "dt__ccp_alpha": [0.0, 0.001]  # minimal cost-complexity pruning
-}
-
-grid_dt = GridSearchCV(
-    estimator=pipe_dt,
-    param_grid=param_grid_dt,
-    scoring="roc_auc",
-    cv=cv,
-    n_jobs=1,        # avoid heavy pickling across processes
-    verbose=1,
-    refit=True
-)
-
-# 1) Fit CV
-grid_dt.fit(X_train_dt, y_train)
-best_dt = grid_dt.best_estimator_
-print("Best DT params:", grid_dt.best_params_)
-print("CV ROC-AUC    :", grid_dt.best_score_)
-
-# 2) Validate — pick KS threshold
-val_proba = best_dt.predict_proba(X_val_dt)[:, 1]
-val_auc   = roc_auc_score(y_val, val_proba)
-val_prauc = average_precision_score(y_val, val_proba)
-fpr, tpr, thr = roc_curve(y_val, val_proba)
-ks_vals = tpr - fpr
-ks = float(np.max(ks_vals))
-thr_ks_dt = float(thr[np.argmax(ks_vals)])
-
-print(f"Validation ROC-AUC: {val_auc:.4f}")
-print(f"Validation PR-AUC : {val_prauc:.4f}")
-print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_dt:.4f}")
-
-val_pred = (val_proba >= thr_ks_dt).astype(int)
-print("\nValidation Confusion Matrix:")
-print(confusion_matrix(y_val, val_pred))
-print("\nValidation Classification Report:")
-print(classification_report(y_val, val_pred, digits=4))
-del val_proba, fpr, tpr, thr, ks_vals
-gc.collect()
-
-# 3) Refit on TRAIN+VAL with best hyperparams
-best_dt_final = grid_dt.best_estimator_
-X_trv_dt = pd.concat([X_train_dt, X_val_dt], copy=False)
-y_trv_dt = pd.concat([y_train, y_val],      copy=False)
-best_dt_final.fit(X_trv_dt, y_trv_dt)
-del X_trv_dt, y_trv_dt
-gc.collect()
-
-# 4) Final TEST evaluation (use validation KS threshold)
-test_proba = best_dt_final.predict_proba(X_test_dt)[:, 1]
-test_auc   = roc_auc_score(y_test, test_proba)
-test_prauc = average_precision_score(y_test, test_proba)
-fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
-ks_t = float(np.max(tpr_t - fpr_t))
-test_pred = (test_proba >= thr_ks_dt).astype(int)
-
-print("\n=== TEST RESULTS (Decision Tree, using validation KS threshold) ===")
-print(f"Test ROC-AUC: {test_auc:.4f}")
-print(f"Test PR-AUC : {test_prauc:.4f}")
-print(f"Test KS     : {ks_t:.4f}")
-print("\nTest Confusion Matrix:")
-print(confusion_matrix(y_test, test_pred))
-print("\nTest Classification Report:")
-print(classification_report(y_test, test_pred, digits=4))
-
-# Optional: top feature importances
-fi_dt = best_dt_final.named_steps["dt"].feature_importances_
-top_dt = pd.Series(fi_dt, index=X.columns).sort_values(ascending=False).head(15)
-print("\nTop 15 Decision Tree feature importances:\n", top_dt)
+# 5) KS curve (combined): plot KS = TPR - FPR vs threshold
+plt.figure()
+for name, (thr, ks_vals) in ks_curves.items():
+    plt.plot(thr, ks_vals, label=f"{name}")
+plt.xlabel("Threshold")
+plt.ylabel("KS = TPR - FPR")
+plt.title("KS Curves on TEST")
+plt.legend()
+plt.tight_layout()
+plt.savefig("ks_test.png", dpi=200)
+plt.show()
