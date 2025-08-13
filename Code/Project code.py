@@ -1,9 +1,9 @@
 # =========================== DETERMINISM HEADER (TOP) ===========================
 # Place ABOVE any numpy/pandas/scikit/xgboost/catboost imports.
-import os, random
+import os, random, gc
 
-SEED = 42                           # single source of truth
-DETERMINISTIC = True                # flip to False for speed over strict repeatability
+SEED = 445                           # single source of truth
+DETERMINISTIC = True                 # flip to False for speed over strict repeatability
 THREADS = 1 if DETERMINISTIC else max(1, os.cpu_count() // 2)
 
 # Make numeric libs single-threaded to avoid nondeterministic reductions
@@ -18,12 +18,12 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 random.seed(SEED)
 # ===============================================================================
 
-import gc
-import numpy as np
+# Core libs
 import pandas as pd
-
+import numpy as np
 from pathlib import Path
 
+# Sklearn base imports
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import StandardScaler
@@ -34,76 +34,21 @@ from sklearn.metrics import (
     confusion_matrix, classification_report
 )
 
-# ====================== UNIFIED REPORTING HELPERS ======================
+# Model libraries
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from sklearn.ensemble import RandomForestClassifier
 
-def _ks_from_proba(y_true, proba):
-    fpr, tpr, thr = roc_curve(y_true, proba)
-    ks_vals = tpr - fpr
-    i = int(np.argmax(ks_vals))
-    return float(ks_vals[i]), float(thr[i])
-
-def _evaluate_block(y_true, proba, thr):
-    auc   = float(roc_auc_score(y_true, proba))
-    prauc = float(average_precision_score(y_true, proba))
-    fpr, tpr, _ = roc_curve(y_true, proba)
-    ks = float(np.max(tpr - fpr))
-    pred = (proba >= thr).astype(int)
-    cm = confusion_matrix(y_true, pred)
-    rpt = classification_report(y_true, pred, digits=4)
-    return auc, prauc, ks, cm, rpt
-
-def print_model_report(
-    name,
-    cv_best_params,
-    cv_best_score,
-    val_proba, y_val,
-    test_proba, y_test,
-):
-    print(f"\n=== {name} CV ===")
-    if cv_best_params is not None:
-        print(f"Best params: {cv_best_params}")
-    else:
-        print("Best params: (n/a)")
-    if cv_best_score is not None:
-        print(f"CV ROC-AUC (mean): {cv_best_score:.6f}")
-    else:
-        print("CV ROC-AUC (mean): (n/a)")
-
-    ks_val, thr_ks = _ks_from_proba(y_val, val_proba)
-    val_auc, val_prauc, _, val_cm, val_rpt = _evaluate_block(y_val, val_proba, thr_ks)
-
-    print(f"\n=== {name} VALIDATION ===")
-    print(f"Validation ROC-AUC: {val_auc:.4f}")
-    print(f"Validation PR-AUC : {val_prauc:.4f}")
-    print(f"Validation KS     : {ks_val:.4f} @ threshold {thr_ks:.4f}")
-    print("\nValidation Confusion Matrix:")
-    print(val_cm)
-    print("\nValidation Classification Report:")
-    print(val_rpt)
-
-    test_auc, test_prauc, ks_test, test_cm, test_rpt = _evaluate_block(y_test, test_proba, thr_ks)
-
-    print(f"\n=== {name} TEST (using validation KS threshold) ===")
-    print(f"Test ROC-AUC: {test_auc:.4f}")
-    print(f"Test PR-AUC : {test_prauc:.4f}")
-    print(f"Test KS     : {ks_test:.4f}")
-    print("\nTest Confusion Matrix:")
-    print(test_cm)
-    print("\nTest Classification Report:")
-    print(test_rpt)
-
-    return thr_ks
-# ======================================================================
+# Plotting
+import matplotlib.pyplot as plt
 
 
 # --- file paths (edit TEST_PATH if needed) ---
-#  r"H:\\git\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv"
-#  r"D:\\Github\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv"
+#   r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
+#   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
 # === 1. Load Data & Data Pre-processing ===
-#  File location for developers:
-#  NOTE: Keep your original path; adjust if running elsewhere.
-df = pd.read_csv(r"H:\\git\\ML-Credit-Risk\\Dataset\\GiveMeSomeCredit\\cs-training.csv")
+df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -123,7 +68,6 @@ median_by_group = (
       .groupby("age_group", observed=False)["MonthlyIncome"]
       .median()
 )
-
 mi_na_mask = df["MonthlyIncome"].isna()
 df.loc[mi_na_mask, "MonthlyIncome"] = df.loc[mi_na_mask, "age_group"].map(median_by_group)
 df["IncomeImputedFlag"] = mi_na_mask.astype("int8")
@@ -174,19 +118,12 @@ cols_past_due = [
     "NumberOfTime60-89DaysPastDueNotWorse",
     "NumberOfTimes90DaysLate"
 ]
-
 for col in cols_past_due:
-    # Ensure numeric
     df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Missing flag for special codes
     df[f"{col}_MissingFlag"] = df[col].isin([96, 98]).astype(int)
-    # Replace special codes with NaN
     df[col] = df[col].replace({96: np.nan, 98: np.nan})
-    # Calculate median from valid (non-NaN) values
     median_val = df[col].median(skipna=True)
-    # Fill NaN with median
     df[col] = df[col].fillna(median_val)
-    # Cap extreme real values
     df[col] = np.where(df[col] > 10, 10, df[col]).astype(int)
 
 # === 2. Split the dataset ===
@@ -225,7 +162,8 @@ else:
 # ------------------------------------------------------------------------------
 
 # ======================================================================================
-# L1 Logistic Regression (with scaling)
+# L1 Logistic Regression
+# L1 needs scaling for stable coefficients; StandardScaler is fine for all-numeric data
 pipe = Pipeline(steps=[
     ("scaler", StandardScaler()),
     ("clf", LogisticRegression(
@@ -240,9 +178,7 @@ pipe = Pipeline(steps=[
 
 cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
 
-param_grid = {
-    "clf__C": np.logspace(-3, 1, 16)  # 16 candidates
-}
+param_grid = {"clf__C": np.logspace(-3, 1, 16)}  # 16 candidates
 
 grid = GridSearchCV(
     estimator=pipe,
@@ -255,11 +191,32 @@ grid = GridSearchCV(
 
 grid.fit(X_train, y_train)
 best_model = grid.best_estimator_
+print("Best C:", grid.best_params_["clf__C"])
+print("CV ROC-AUC (mean):", grid.best_score_)
 
-# VALIDATION probabilities from CV-best model
-val_proba_logit = best_model.predict_proba(X_val)[:, 1]
+# Validate on VAL set
+val_proba = best_model.predict_proba(X_val)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
 
-# Retrain on TRAIN+VAL with best C for TEST probabilities
+# KS statistic (max TPR-FPR)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = np.max(ks_vals)
+thr_ks = thr[np.argmax(ks_vals)]
+
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
+
+# Choose threshold by max KS on validation
+val_pred = (val_proba >= thr_ks).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+
+# Retrain on TRAIN+VAL with best hyperparams, then evaluate on TEST
 best_model_final = GridSearchCV(
     estimator=pipe,
     param_grid={"clf__C": [grid.best_params_["clf__C"]]},
@@ -268,31 +225,38 @@ best_model_final = GridSearchCV(
     n_jobs=-1
 ).fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val])).best_estimator_
 
-test_proba_logit = best_model_final.predict_proba(X_test)[:, 1]
+test_proba = best_model_final.predict_proba(X_test)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = np.max(tpr_t - fpr_t)
 
-_ = print_model_report(
-    name="L1-Logit",
-    cv_best_params=grid.best_params_,
-    cv_best_score=grid.best_score_,
-    val_proba=val_proba_logit, y_val=y_val,
-    test_proba=test_proba_logit, y_test=y_test
-)
+# Use the threshold chosen on validation (thr_ks) for fair final metrics
+test_pred = (test_proba >= thr_ks).astype(int)
+
+print("\n=== TEST RESULTS (using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
 
 # ======================================================================================
 # XGBoost
-from xgboost import XGBClassifier
+# 0) Reduce footprint: use float32 (no copy if already float32)
+X_train = X_train.astype(np.float32, copy=False)
+X_val   = X_val.astype(np.float32,   copy=False)
+X_test  = X_test.astype(np.float32,  copy=False)
 
-# Reduce footprint: use float32 (no copy if already float32)
-X_train_xgb = X_train.astype(np.float32, copy=False)
-X_val_xgb   = X_val.astype(np.float32,   copy=False)
-X_test_xgb  = X_test.astype(np.float32,  copy=False)
-
-# CV setup (smaller grid + 3-fold to save memory)
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+# 1) CV setup (smaller grid + 3-fold to save memory)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 pos, neg = int((y_train == 1).sum()), int((y_train == 0).sum())
 scale_pos_weight = neg / max(pos, 1)
 
 pipe_xgb = Pipeline([
+    # trees don't need scaling, but we must impute missing values
     ("imp", SimpleImputer(strategy="median")),
     ("xgb", XGBClassifier(
         objective="binary:logistic",
@@ -313,6 +277,7 @@ pipe_xgb = Pipeline([
     ))
 ])
 
+# compact grid (8 combos)
 param_grid_xgb = {
     "xgb__n_estimators": [400, 800],
     "xgb__max_depth": [4, 6],
@@ -323,42 +288,69 @@ param_grid_xgb = {
 grid_xgb = GridSearchCV(
     estimator=pipe_xgb,
     param_grid=param_grid_xgb,
-    scoring="roc_auc",
+    scoring="roc_auc",     # keep identical to your L1 setup
     cv=cv,
-    n_jobs=1,
+    n_jobs=1,              # single process to avoid pickling big data
     verbose=1,
     refit=True
 )
 
-grid_xgb.fit(X_train_xgb, y_train)
+# 2) Fit CV
+grid_xgb.fit(X_train, y_train)
 best_xgb = grid_xgb.best_estimator_
+print("Best params:", grid_xgb.best_params_)
+print("CV ROC-AUC :", grid_xgb.best_score_)
+gc.collect()
 
-# VALIDATION proba
-val_proba_xgb = best_xgb.predict_proba(X_val_xgb)[:, 1]
+# 3) Validate on VAL — get KS threshold
+val_proba = best_xgb.predict_proba(X_val)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks = float(thr[np.argmax(ks_vals)])
 
-# Refit on TRAIN+VAL (no extra CV)
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks:.4f}")
+
+val_pred = (val_proba >= thr_ks).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 4) Refit on TRAIN+VAL with best hyperparams (no extra CV)
 best_xgb_final = grid_xgb.best_estimator_
-X_trv = pd.concat([X_train_xgb, X_val_xgb], copy=False)
+X_trv = pd.concat([X_train, X_val], copy=False)
 y_trv = pd.concat([y_train, y_val], copy=False)
 best_xgb_final.fit(X_trv, y_trv)
 del X_trv, y_trv
 gc.collect()
 
-# TEST proba
-test_proba_xgb = best_xgb_final.predict_proba(X_test_xgb)[:, 1]
+# 5) Final TEST evaluation (use validation KS threshold)
+test_proba = best_xgb_final.predict_proba(X_test)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks).astype(int)
 
-_ = print_model_report(
-    name="XGBoost",
-    cv_best_params=grid_xgb.best_params_,
-    cv_best_score=grid_xgb.best_score_,
-    val_proba=val_proba_xgb, y_val=y_val,
-    test_proba=test_proba_xgb, y_test=y_test
-)
+print("\n=== TEST RESULTS (using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
 
 # ======================================================================================
 # CatBoost
-from catboost import CatBoostClassifier
-
+# Convert to float32 (CatBoost handles its own NaN imputation)
 X_train_cb = X_train.copy()
 X_val_cb   = X_val.copy()
 X_test_cb  = X_test.copy()
@@ -394,17 +386,33 @@ for params in param_grid_cb:
         **params
     )
     cb.fit(X_train_cb, y_train, eval_set=(X_val_cb, y_val), use_best_model=True)
-    vproba = cb.predict_proba(X_val_cb)[:, 1]
-    vauc = roc_auc_score(y_val, vproba)
-    if vauc > best_auc:
-        best_auc = vauc
+    val_proba = cb.predict_proba(X_val_cb)[:, 1]
+    val_auc = roc_auc_score(y_val, val_proba)
+    if val_auc > best_auc:
+        best_auc = val_auc
         best_cb = cb
         best_params = params
 
-# VALIDATION proba from best model
-val_proba_cb = best_cb.predict_proba(X_val_cb)[:, 1]
+print("Best CatBoost params:", best_params)
+print("Validation ROC-AUC:", best_auc)
 
-# Retrain FINAL on TRAIN+VAL
+# Compute validation PR-AUC and KS
+val_proba = best_cb.predict_proba(X_val_cb)[:, 1]
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_cb = float(thr[np.argmax(ks_vals)])
+print(f"Validation PR-AUC: {val_prauc:.4f}")
+print(f"Validation KS    : {ks:.4f} @ threshold {thr_ks_cb:.4f}")
+
+val_pred = (val_proba >= thr_ks_cb).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix[y_val, val_pred])  # <-- if this line errors, replace with: print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+
+# Retrain on TRAIN+VAL
 cb_final = CatBoostClassifier(
     task_type="CPU",
     iterations=2000,
@@ -412,8 +420,7 @@ cb_final = CatBoostClassifier(
     loss_function="Logloss",
     eval_metric="AUC",
     class_weights=class_weights,
-    random_seed=SEED,
-    thread_count=THREADS,
+    random_seed=42,
     verbose=False,
     **best_params
 )
@@ -421,28 +428,32 @@ X_trv_cb = pd.concat([X_train_cb, X_val_cb], copy=False)
 y_trv_cb = pd.concat([y_train, y_val], copy=False)
 cb_final.fit(X_trv_cb, y_trv_cb, use_best_model=False)
 
-# TEST proba
-test_proba_cb = cb_final.predict_proba(X_test_cb)[:, 1]
+# Test set evaluation
+test_proba = cb_final.predict_proba(X_test_cb)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks_cb).astype(int)
 
-_ = print_model_report(
-    name="CatBoost",
-    cv_best_params=best_params,
-    cv_best_score=best_auc,   # using best validation AUC from the simple grid loop
-    val_proba=val_proba_cb, y_val=y_val,
-    test_proba=test_proba_cb, y_test=y_test
-)
-
+print("\n=== TEST RESULTS (CatBoost, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
 gc.collect()
 
 # ======================================================================================
 # Random Forest
-from sklearn.ensemble import RandomForestClassifier
-
+# Trees don't need scaling, but they can't handle NaNs -> impute
 X_train_rf = X_train.astype(np.float32, copy=False)
 X_val_rf   = X_val.astype(np.float32,   copy=False)
 X_test_rf  = X_test.astype(np.float32,  copy=False)
 
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
 pipe_rf = Pipeline([
     ("imp", SimpleImputer(strategy="median")),
@@ -454,10 +465,11 @@ pipe_rf = Pipeline([
         min_samples_leaf=1,
         class_weight="balanced_subsample",
         n_jobs=max(1, os.cpu_count() // 2),
-        random_state=SEED
+        random_state=42
     ))
 ])
 
+# compact grid (8 combos)
 param_grid_rf = {
     "rf__n_estimators": [400, 800],
     "rf__max_depth": [None, 12],
@@ -475,13 +487,34 @@ grid_rf = GridSearchCV(
     refit=True
 )
 
+# 1) Fit CV
 grid_rf.fit(X_train_rf, y_train)
 best_rf = grid_rf.best_estimator_
+print("Best RF params:", grid_rf.best_params_)
+print("CV ROC-AUC    :", grid_rf.best_score_)
 
-# VALIDATION proba
-val_proba_rf = best_rf.predict_proba(X_val_rf)[:, 1]
+# 2) Validate — pick KS threshold
+val_proba = best_rf.predict_proba(X_val_rf)[:, 1]
+val_auc   = roc_auc_score(y_val, val_proba)
+val_prauc = average_precision_score(y_val, val_proba)
+fpr, tpr, thr = roc_curve(y_val, val_proba)
+ks_vals = tpr - fpr
+ks = float(np.max(ks_vals))
+thr_ks_rf = float(thr[np.argmax(ks_vals)])
 
-# Refit on TRAIN+VAL
+print(f"Validation ROC-AUC: {val_auc:.4f}")
+print(f"Validation PR-AUC : {val_prauc:.4f}")
+print(f"Validation KS     : {ks:.4f} @ threshold {thr_ks_rf:.4f}")
+
+val_pred = (val_proba >= thr_ks_rf).astype(int)
+print("\nValidation Confusion Matrix:")
+print(confusion_matrix(y_val, val_pred))
+print("\nValidation Classification Report:")
+print(classification_report(y_val, val_pred, digits=4))
+del val_proba, fpr, tpr, thr, ks_vals
+gc.collect()
+
+# 3) Refit on TRAIN+VAL with best hyperparams
 best_rf_final = grid_rf.best_estimator_
 X_trv_rf = pd.concat([X_train_rf, X_val_rf], copy=False)
 y_trv_rf = pd.concat([y_train, y_val],       copy=False)
@@ -489,97 +522,34 @@ best_rf_final.fit(X_trv_rf, y_trv_rf)
 del X_trv_rf, y_trv_rf
 gc.collect()
 
-# TEST proba
-test_proba_rf = best_rf_final.predict_proba(X_test_rf)[:, 1]
+# 4) Final TEST evaluation (use validation KS threshold)
+test_proba = best_rf_final.predict_proba(X_test_rf)[:, 1]
+test_auc   = roc_auc_score(y_test, test_proba)
+test_prauc = average_precision_score(y_test, test_proba)
+fpr_t, tpr_t, thr_t = roc_curve(y_test, test_proba)
+ks_t = float(np.max(tpr_t - fpr_t))
+test_pred = (test_proba >= thr_ks_rf).astype(int)
 
-_ = print_model_report(
-    name="Random Forest",
-    cv_best_params=grid_rf.best_params_,
-    cv_best_score=grid_rf.best_score_,
-    val_proba=val_proba_rf, y_val=y_val,
-    test_proba=test_proba_rf, y_test=y_test
-)
-
-# ======================================================================================
-# Decision Tree
-from sklearn.tree import DecisionTreeClassifier
-
-X_train_dt = X_train.astype(np.float32, copy=False)
-X_val_dt   = X_val.astype(np.float32,   copy=False)
-X_test_dt  = X_test.astype(np.float32,  copy=False)
-
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
-
-pipe_dt = Pipeline([
-    ("imp", SimpleImputer(strategy="median")),
-    ("dt", DecisionTreeClassifier(
-        criterion="gini",
-        class_weight="balanced",
-        random_state=SEED
-    ))
-])
-
-param_grid_dt = {
-    "dt__max_depth": [None, 6, 12, 20],
-    "dt__min_samples_split": [2, 10],
-    "dt__min_samples_leaf": [1, 5, 20],
-    "dt__max_features": [None, "sqrt"],
-    "dt__ccp_alpha": [0.0, 0.001]
-}
-
-grid_dt = GridSearchCV(
-    estimator=pipe_dt,
-    param_grid=param_grid_dt,
-    scoring="roc_auc",
-    cv=cv,
-    n_jobs=1,
-    verbose=1,
-    refit=True
-)
-
-grid_dt.fit(X_train_dt, y_train)
-best_dt = grid_dt.best_estimator_
-
-# VALIDATION proba
-val_proba_dt = best_dt.predict_proba(X_val_dt)[:, 1]
-
-# Refit on TRAIN+VAL
-best_dt_final = grid_dt.best_estimator_
-X_trv_dt = pd.concat([X_train_dt, X_val_dt], copy=False)
-y_trv_dt = pd.concat([y_train, y_val],      copy=False)
-best_dt_final.fit(X_trv_dt, y_trv_dt)
-del X_trv_dt, y_trv_dt
-gc.collect()
-
-# TEST proba
-test_proba_dt = best_dt_final.predict_proba(X_test_dt)[:, 1]
-
-_ = print_model_report(
-    name="Decision Tree",
-    cv_best_params=grid_dt.best_params_,
-    cv_best_score=grid_dt.best_score_,
-    val_proba=val_proba_dt, y_val=y_val,
-    test_proba=test_proba_dt, y_test=y_test
-)
-
-# Optional: top feature importances
-fi_dt = best_dt_final.named_steps["dt"].feature_importances_
-top_dt = pd.Series(fi_dt, index=X.columns).sort_values(ascending=False).head(15)
-print("\nTop 15 Decision Tree feature importances:\n", top_dt)
+print("\n=== TEST RESULTS (Random Forest, using validation KS threshold) ===")
+print(f"Test ROC-AUC: {test_auc:.4f}")
+print(f"Test PR-AUC : {test_prauc:.4f}")
+print(f"Test KS     : {ks_t:.4f}")
+print("\nTest Confusion Matrix:")
+print(confusion_matrix(y_test, test_pred))
+print("\nTest Classification Report:")
+print(classification_report(y_test, test_pred, digits=4))
 
 # ================================================================================
-# === PLOTS: ROC / PR / KS on TEST for 5 models ===
-import matplotlib.pyplot as plt
-
+# === PLOTS: ROC / PR / KS on TEST for 4 models (Logit L1, XGB, CatBoost, RF) ===
+# 1) Collect test-set probabilities (use the same matrices each model used above)
 probas = {
-    "L1-Logit":     test_proba_logit,
-    "XGBoost":      test_proba_xgb,
-    "CatBoost":     test_proba_cb,
-    "RandomForest": test_proba_rf,
-    "DecisionTree": test_proba_dt,
+    "L1-Logit":     best_model_final.predict_proba(X_test)[:, 1],
+    "XGBoost":      best_xgb_final.predict_proba(X_test)[:, 1],
+    "CatBoost":     cb_final.predict_proba(X_test_cb)[:, 1],
+    "RandomForest": best_rf_final.predict_proba(X_test_rf)[:, 1],
 }
 
-# Summary table: AUC / PR-AUC / KS (max TPR-FPR)
+# 2) Summary table: AUC / PR-AUC / KS (max TPR-FPR)
 summary_rows = []
 ks_curves = {}  # store (thr, ks_vals) for plotting
 for name, p in probas.items():
@@ -597,7 +567,7 @@ summary = pd.DataFrame(summary_rows, columns=["Model", "ROC-AUC", "PR-AUC", "KS"
 print("\n=== TEST summary ===")
 print(summary.to_string(index=False))
 
-# ROC curve (combined)
+# 3) ROC curve (combined)
 plt.figure()
 for name, p in probas.items():
     fpr, tpr, _ = roc_curve(y_test, p)
@@ -611,7 +581,7 @@ plt.tight_layout()
 plt.savefig("roc_test.png", dpi=200)
 plt.show()
 
-# PR curve (combined)
+# 4) PR curve (combined)
 plt.figure()
 for name, p in probas.items():
     prec, rec, _ = precision_recall_curve(y_test, p)
@@ -624,7 +594,7 @@ plt.tight_layout()
 plt.savefig("pr_test.png", dpi=200)
 plt.show()
 
-# KS curve (combined)
+# 5) KS curve (combined): plot KS = TPR - FPR vs threshold
 plt.figure()
 for name, (thr, ks_vals) in ks_curves.items():
     plt.plot(thr, ks_vals, label=f"{name}")
@@ -636,111 +606,70 @@ plt.tight_layout()
 plt.savefig("ks_test.png", dpi=200)
 plt.show()
 
+# === Portfolio VaR & ES on TEST (Monte Carlo, independent defaults) ===
+# Interprets each account's loss as EAD * LGD if it defaults.
+# Defaults: EAD = 1, LGD = 1  -> VaR/ES are in "default counts".
+# To use your own EAD/LGD, set EAD_VEC to a 1D array aligned with X_test rows,
+# and set LGD_SCALAR to a number in [0,1] (or provide a 1D vector).
 
-# ================================================================================
-# QRM ADD-ON: Portfolio VaR & ES from PDs (Monte Carlo, Gaussian copula)
-# Place this block directly AFTER your existing code (after the ROC/PR/KS plots).
-# ================================================================================
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from math import sqrt
-from scipy.stats import norm
+ALPHAS = [0.95, 0.975, 0.99]   # confidence levels
+NSIMS  = 8000                  # increase if you want smoother estimates
+SEED_MC = SEED                 # keep deterministic with your global seed
 
-rng = np.random.default_rng(SEED)
+# ---- exposures / severities (edit if you have them) ----
+N_test = len(y_test)
+EAD_VEC    = np.ones(N_test, dtype=float)  # <-- replace with your EADs if available
+LGD_SCALAR = 1.0                           # <-- replace (e.g., 0.45) or use a vector same length as EAD_VEC
+W = EAD_VEC * LGD_SCALAR                   # per-account loss if default occurs
 
-# ---------- 1) Portfolio setup (adjust if you have real EAD/LGD) ----------
-N = len(next(iter(probas.values())))            # number of test accounts
-EAD_const = 1000.0                               # constant exposure per account ($)
-# Fixed LGD per account from Beta(2,5) ~ mean 0.286
-LGD = rng.beta(2.0, 5.0, size=N).astype(np.float64)
-
-# Effective per-account loss weight
-W = EAD_const * LGD  # shape (N,)
-
-# ---------- 2) Bin accounts by PD ----------
-def make_pd_bins(p, w, n_bins=200):
-    """Return per-bin counts, avg PD, and avg exposure-per-default occurrence."""
-    p = np.asarray(p, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    n = len(p)
-    n_bins = int(min(n_bins, max(1, n)))  # cap at N
-    order = np.argsort(p)
-    bins = np.array_split(order, n_bins)
-    n_b = np.array([len(b) for b in bins], dtype=np.int32)
-    n_b = np.where(n_b == 0, 1, n_b)
-    p_b = np.array([p[b].mean() for b in bins], dtype=np.float64)
-    e_b = np.array([w[b].sum() / max(len(b), 1) for b in bins], dtype=np.float64)
-    return n_b, p_b, e_b
-
-# ---------- 3) Simulator ----------
-def simulate_losses_binomial(n_b, p_b, e_b, sims=20000, rho=0.0, batch=2000, seed=SEED):
-    """Monte Carlo portfolio loss using per-bin binomial draws.
-       rho=0: independent defaults; rho>0: one-factor Gaussian copula."""
+def simulate_portfolio_losses(p_vec, w_vec, nsims=NSIMS, seed=SEED_MC):
+    """Simulate total portfolio loss nsims times for Bernoulli defaults with probs p_vec."""
     rng = np.random.default_rng(seed)
-    a_b = norm.ppf(np.clip(p_b, 1e-12, 1-1e-12))
-    B = len(n_b)
-    out = np.empty(sims, dtype=np.float64)
-    i = 0
-    while i < sims:
-        m = min(batch, sims - i)
-        if rho <= 0.0:
-            D = rng.binomial(n=n_b, p=p_b, size=(m, B)).astype(np.float64)
-        else:
-            F = rng.standard_normal(size=m)  # common factor
-            z = (a_b[None, :] - sqrt(rho) * F[:, None]) / sqrt(max(1e-12, 1.0 - rho))
-            p_cond = norm.cdf(z)
-            D = rng.binomial(n=n_b[None, :], p=p_cond).astype(np.float64)
-        out[i:i+m] = D.dot(e_b)
-        i += m
+    n   = p_vec.shape[0]
+    out = np.empty(nsims, dtype=float)
+    # scenario-wise simulation to keep memory low
+    for s in range(nsims):
+        defaults = rng.random(n) < p_vec
+        out[s] = float(np.dot(defaults, w_vec))
     return out
 
-def var_es(x, alpha=0.99):
-    """Return (VaR_alpha, ES_alpha) for array x of losses."""
-    x = np.sort(np.asarray(x, dtype=np.float64))
-    n = x.size
-    k = int(np.ceil(alpha * n)) - 1
-    k = max(0, min(k, n-1))
-    VaR = x[k]
-    ES = x[k:].mean() if k < n else x[-1]
-    return float(VaR), float(ES)
+def var_es_from_losses(losses, alpha):
+    """Empirical VaR and ES from a vector of simulated losses."""
+    # VaR as the empirical alpha-quantile (conservative/higher)
+    var = float(np.quantile(losses, alpha, method="higher"))
+    es  = float(losses[losses >= var].mean())
+    return var, es
 
-# ---------- 4) Run sims & summary ----------
-rhos = [0.0, 0.1, 0.3, 0.5]
-alpha_levels = [0.975, 0.99]
 rows = []
-cdf_for_plot = {}
+for name, p in probas.items():
+    p = np.asarray(p, dtype=float)
+    # use a name-dependent seed for reproducibility while varying between models
+    losses = simulate_portfolio_losses(p, W, nsims=NSIMS, seed=SEED_MC + (abs(hash(name)) % 10000))
+    meanL  = float(losses.mean())
+    stdL   = float(losses.std(ddof=1))
+    row = {
+        "Model": name,
+        "MeanLoss": meanL,
+        "StdLoss": stdL,
+        "MeanLossRate": meanL / np.sum(EAD_VEC)  # if EAD=1, this is mean defaults / N
+    }
+    for a in ALPHAS:
+        v, e = var_es_from_losses(losses, a)
+        row[f"VaR@{int(a*100)}"] = v
+        row[f"ES@{int(a*100)}"]  = e
+        row[f"VaRrate@{int(a*100)}"] = v / np.sum(EAD_VEC)
+        row[f"ESrate@{int(a*100)}"]  = e / np.sum(EAD_VEC)
+    rows.append(row)
 
-for model_name, p in probas.items():
-    p = np.asarray(p, dtype=np.float64)
-    n_b, p_b, e_b = make_pd_bins(p, W, n_bins=200)
-    for rho in rhos:
-        losses = simulate_losses_binomial(n_b, p_b, e_b, sims=20000, rho=rho, batch=2000, seed=SEED+int(1000*rho))
-        el = float(losses.mean())
-        for a in alpha_levels:
-            VaR, ES = var_es(losses, alpha=a)
-            rows.append([model_name, rho, a, el, VaR, ES])
-        if abs(rho - 0.30) < 1e-9:
-            cdf_for_plot[model_name] = np.sort(losses)
+var_es_df = pd.DataFrame(rows).sort_values(f"VaR@{int(ALPHAS[-1]*100)}", ascending=False)
 
-qrm_df = pd.DataFrame(rows, columns=["Model", "Rho", "Alpha", "ExpectedLoss", "VaR", "ES"])
-print("\n=== Portfolio Risk (Monte Carlo, 20k sims per rho) ===")
-print(qrm_df.sort_values(["Rho", "Alpha", "VaR"], ascending=[True, True, False]).to_string(index=False))
-qrm_df.to_csv("qrm_var_es_summary.csv", index=False)
+print("\n=== TEST Portfolio VaR & ES (counts and rates; assumes indep. defaults, EAD=1, LGD=1) ===")
+cols_order = ["Model", "MeanLoss", "StdLoss",
+              *(f for a in ALPHAS for f in (f"VaR@{int(a*100)}", f"ES@{int(a*100)}")),
+              "MeanLossRate",
+              *(f for a in ALPHAS for f in (f"VaRrate@{int(a*100)}", f"ESrate@{int(a*100)}"))]
+print(var_es_df[cols_order].to_string(index=False))
 
-# ---------- 5) Plot overlay loss CDFs at rho=0.30 ----------
-plt.figure()
-for name, xs in cdf_for_plot.items():
-    n = xs.size
-    u = np.linspace(0, 1, n, endpoint=False)
-    plt.plot(xs, u, label=name)
-plt.xlabel("Portfolio Loss")
-plt.ylabel("Empirical CDF")
-plt.title("Loss CDF on TEST (rho = 0.30)")
-plt.legend()
-plt.tight_layout()
-plt.savefig("loss_cdf_rho0.30.png", dpi=200)
-plt.show()
-
-print("\nSaved: qrm_var_es_summary.csv, loss_cdf_rho0.30.png")
-# ================================================================================
+# Optional: save to CSV for your report
+var_es_df.to_csv("var_es_summary.csv", index=False)
+print("\nSaved: var_es_summary.csv")
