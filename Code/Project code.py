@@ -42,13 +42,14 @@ from sklearn.ensemble import RandomForestClassifier
 # Plotting
 import matplotlib.pyplot as plt
 
+import hashlib
 
 # --- file paths (edit TEST_PATH if needed) ---
-#   r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
+#   r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv"
 #   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
 # === 1. Load Data & Data Pre-processing ===
-df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv")
+df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv")
 
 # drop stray index col (assign back)
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -408,7 +409,7 @@ print(f"Validation KS    : {ks:.4f} @ threshold {thr_ks_cb:.4f}")
 
 val_pred = (val_proba >= thr_ks_cb).astype(int)
 print("\nValidation Confusion Matrix:")
-print(confusion_matrix[y_val, val_pred])  # <-- if this line errors, replace with: print(confusion_matrix(y_val, val_pred))
+print(confusion_matrix(y_val, val_pred))
 print("\nValidation Classification Report:")
 print(classification_report(y_val, val_pred, digits=4))
 
@@ -614,20 +615,18 @@ plt.show()
 
 ALPHAS = [0.95, 0.975, 0.99]   # confidence levels
 NSIMS  = 8000                  # increase if you want smoother estimates
-SEED_MC = SEED                 # keep deterministic with your global seed
 
 # ---- exposures / severities (edit if you have them) ----
 N_test = len(y_test)
 EAD_VEC    = np.ones(N_test, dtype=float)  # <-- replace with your EADs if available
-LGD_SCALAR = 1.0                           # <-- replace (e.g., 0.45) or use a vector same length as EAD_VEC
+LGD_SCALAR = 1.0                           # <-- replace (e.g., 0.45) or a vector
 W = EAD_VEC * LGD_SCALAR                   # per-account loss if default occurs
 
-def simulate_portfolio_losses(p_vec, w_vec, nsims=NSIMS, seed=SEED_MC):
+def simulate_portfolio_losses(p_vec, w_vec, nsims=NSIMS, seed=SEED):
     """Simulate total portfolio loss nsims times for Bernoulli defaults with probs p_vec."""
     rng = np.random.default_rng(seed)
     n   = p_vec.shape[0]
     out = np.empty(nsims, dtype=float)
-    # scenario-wise simulation to keep memory low
     for s in range(nsims):
         defaults = rng.random(n) < p_vec
         out[s] = float(np.dot(defaults, w_vec))
@@ -635,28 +634,34 @@ def simulate_portfolio_losses(p_vec, w_vec, nsims=NSIMS, seed=SEED_MC):
 
 def var_es_from_losses(losses, alpha):
     """Empirical VaR and ES from a vector of simulated losses."""
-    # VaR as the empirical alpha-quantile (conservative/higher)
-    var = float(np.quantile(losses, alpha, method="higher"))
+    var = float(np.quantile(losses, alpha, method="higher"))  # conservative quantile
     es  = float(losses[losses >= var].mean())
     return var, es
 
 rows = []
 for name, p in probas.items():
     p = np.asarray(p, dtype=float)
-    # use a name-dependent seed for reproducibility while varying between models
-    losses = simulate_portfolio_losses(p, W, nsims=NSIMS, seed=SEED_MC + (abs(hash(name)) % 10000))
+
+    # Stable per-model seed derived ONLY from your SEED and the model name.
+    # (No Python salted hash; deterministic across sessions/machines.)
+    seed_model = SEED + int.from_bytes(
+        hashlib.sha256(f"{SEED}:{name}".encode("utf-8")).digest()[:4],
+        "little"
+    )
+
+    losses = simulate_portfolio_losses(p, W, nsims=NSIMS, seed=seed_model)
     meanL  = float(losses.mean())
     stdL   = float(losses.std(ddof=1))
     row = {
         "Model": name,
         "MeanLoss": meanL,
         "StdLoss": stdL,
-        "MeanLossRate": meanL / np.sum(EAD_VEC)  # if EAD=1, this is mean defaults / N
+        "MeanLossRate": meanL / np.sum(EAD_VEC)
     }
     for a in ALPHAS:
         v, e = var_es_from_losses(losses, a)
-        row[f"VaR@{int(a*100)}"] = v
-        row[f"ES@{int(a*100)}"]  = e
+        row[f"VaR@{int(a*100)}"]     = v
+        row[f"ES@{int(a*100)}"]      = e
         row[f"VaRrate@{int(a*100)}"] = v / np.sum(EAD_VEC)
         row[f"ESrate@{int(a*100)}"]  = e / np.sum(EAD_VEC)
     rows.append(row)
@@ -669,7 +674,3 @@ cols_order = ["Model", "MeanLoss", "StdLoss",
               "MeanLossRate",
               *(f for a in ALPHAS for f in (f"VaRrate@{int(a*100)}", f"ESrate@{int(a*100)}"))]
 print(var_es_df[cols_order].to_string(index=False))
-
-# Optional: save to CSV for your report
-var_es_df.to_csv("var_es_summary.csv", index=False)
-print("\nSaved: var_es_summary.csv")
