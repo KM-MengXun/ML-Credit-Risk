@@ -248,7 +248,7 @@ X_val   = X_val.astype(np.float32,   copy=False)
 X_test  = X_test.astype(np.float32,  copy=False)
 
 # CV setup
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 pos, neg = int((y_train == 1).sum()), int((y_train == 0).sum())
 scale_pos_weight = neg / max(pos, 1)
 
@@ -415,7 +415,7 @@ cb_final = CatBoostClassifier(
     loss_function="Logloss",
     eval_metric="AUC",
     class_weights=class_weights,
-    random_seed=SEED,
+    random_seed=42,
     verbose=False,
     **best_params
 )
@@ -447,7 +447,7 @@ X_train_rf = X_train.astype(np.float32, copy=False)
 X_val_rf   = X_val.astype(np.float32,   copy=False)
 X_test_rf  = X_test.astype(np.float32,  copy=False)
 
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
 pipe_rf = Pipeline([
     ("imp", SimpleImputer(strategy="median")),
@@ -459,7 +459,7 @@ pipe_rf = Pipeline([
         min_samples_leaf=1,
         class_weight="balanced_subsample",
         n_jobs=max(1, os.cpu_count() // 2),
-        random_state=SEED
+        random_state=42
     ))
 ])
 
