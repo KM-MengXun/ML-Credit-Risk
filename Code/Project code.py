@@ -49,7 +49,7 @@ import hashlib
 #   r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv"
 #   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
-df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv")
+df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\cs-training.csv")
 
 # drop index column if exists
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
