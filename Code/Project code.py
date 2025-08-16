@@ -1,3 +1,23 @@
+# =========================== Export terminal output to pdf ===========================
+import os, random, gc
+import sys, io, atexit
+class Tee:
+    def __init__(self, *files): self.files = files
+    def write(self, x): 
+        for f in self.files: f.write(x)
+    def flush(self):
+        for f in self.files: f.flush()
+
+_log = open("run_output.txt", "w", encoding="utf-8")
+sys.stdout = Tee(sys.stdout, _log)   # print() goes to console + file
+sys.stderr = Tee(sys.stderr, _log)   # errors too
+
+@atexit.register
+def _close_log():
+    try: _log.close()
+    except: pass
+
+
 # =========================== DETERMINISM HEADER ===========================
 import os, random, gc
 
@@ -49,7 +69,7 @@ import hashlib
 #   r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv"
 #   r"D:\Github\ML-Credit-Risk\Dataset\GiveMeSomeCredit\cs-training.csv"
 
-df = pd.read_csv(r"D:\Github\ML-Credit-Risk\Dataset\cs-training.csv")
+df = pd.read_csv(r"H:\git\ML-Credit-Risk\Dataset\cs-training.csv")
 
 # drop index column if exists
 df = df.drop(columns=["Unnamed: 0"], errors="ignore")
@@ -627,6 +647,11 @@ def var_es_from_losses(losses, alpha):
     return var, es
 
 rows = []
+
+def pct_label(a: float) -> str:
+    x = a * 100
+    return f"{x:.1f}".rstrip("0").rstrip(".")
+
 for name, p in probas.items():
     p = np.asarray(p, dtype=float)
     seed_model = SEED + int.from_bytes(
@@ -645,17 +670,33 @@ for name, p in probas.items():
     }
     for a in ALPHAS:
         v, e = var_es_from_losses(losses, a)
-        row[f"VaR@{int(a*100)}"]     = v
-        row[f"ES@{int(a*100)}"]      = e
-        row[f"VaRrate@{int(a*100)}"] = v / np.sum(EAD_VEC)
-        row[f"ESrate@{int(a*100)}"]  = e / np.sum(EAD_VEC)
+        row[f"VaR@{pct_label(a)}"]     = v
+        row[f"ES@{pct_label(a)}"]      = e
+        row[f"VaRrate@{pct_label(a)}"] = v / np.sum(EAD_VEC)
+        row[f"ESrate@{pct_label(a)}"]  = e / np.sum(EAD_VEC)
     rows.append(row)
 
-var_es_df = pd.DataFrame(rows).sort_values(f"VaR@{int(ALPHAS[-1]*100)}", ascending=False)
+var_es_df = pd.DataFrame(rows).sort_values(f"VaR@{pct_label(ALPHAS[-1])}", ascending=False)
 
 print("\n=== TEST Portfolio VaR & ES (counts and rates; assumes indep. defaults, EAD=1, LGD=1) ===")
 cols_order = ["Model", "MeanLoss", "StdLoss",
-              *(f for a in ALPHAS for f in (f"VaR@{int(a*100)}", f"ES@{int(a*100)}")),
+              *(f for a in ALPHAS for f in (f"VaR@{pct_label(a)}", f"ES@{pct_label(a)}")),
               "MeanLossRate",
-              *(f for a in ALPHAS for f in (f"VaRrate@{int(a*100)}", f"ESrate@{int(a*100)}"))]
+              *(f for a in ALPHAS for f in (f"VaRrate@{pct_label(a)}", f"ESrate@{pct_label(a)}"))]
 print(var_es_df[cols_order].to_string(index=False))
+
+
+# =========================== Export terminal output to pdf ===========================
+try:
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=10)
+    pdf.add_page()
+    pdf.set_font("Courier", size=9)
+    with open("run_output.txt", encoding="utf-8") as f:
+        for line in f:
+            pdf.multi_cell(0, 4, line.rstrip("\n"))  # wraps long lines
+    pdf.output("run_output.pdf")
+    print("\nSaved PDF: run_output.pdf")
+except Exception as e:
+    print(f"\nPDF export skipped: {e}\n(Install with: pip install fpdf2)")
